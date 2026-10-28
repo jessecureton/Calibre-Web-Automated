@@ -89,6 +89,11 @@ def ensure_position_bridge_table(conn):
 # recorded but not forwarded. Tolerates modest Kobo clock drift.
 DRIFT = timedelta(seconds=60)
 
+# A reader opened at a pushed position reports the start of the page holding it,
+# which can be a little earlier. A report at most this many characters before the
+# position just sent, in the same chapter, is that landing rather than a move.
+LANDING_CHARS = 4000
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -104,13 +109,15 @@ def _utc(value: datetime) -> datetime:
 
 
 def decide_kobo(row: Optional[PositionBridgeState], key: str, read_at: datetime,
-                translated: Optional[str]) -> Decision:
+                translated: Optional[str], landing: bool = False) -> Decision:
     """Whether a Kobo position report ("<zip path>#<span>") is a move to forward."""
     if row is not None and key in (row.kobo_received, row.kobo_sent):
         return Decision(False, "not-moved")
     if row is not None and row.kosync_received_at is not None \
             and _utc(read_at) < _utc(row.kosync_received_at) - DRIFT:
         return Decision(False, "older-than-other-move")
+    if landing:
+        return Decision(False, "landing")
     if translated is None:
         return Decision(False, "untranslatable")
     if row is not None and translated in (row.kosync_received, row.kosync_sent):
@@ -119,10 +126,12 @@ def decide_kobo(row: Optional[PositionBridgeState], key: str, read_at: datetime,
 
 
 def decide_kosync(row: Optional[PositionBridgeState], xpointer: str,
-                  translated_key: Optional[str]) -> Decision:
+                  translated_key: Optional[str], landing: bool = False) -> Decision:
     """Whether a KOReader sync position report is a move to forward to the Kobo."""
     if row is not None and xpointer in (row.kosync_received, row.kosync_sent):
         return Decision(False, "not-moved")
+    if landing:
+        return Decision(False, "landing")
     if translated_key is None:
         return Decision(False, "untranslatable")
     if row is not None and translated_key in (row.kobo_received, row.kobo_sent):

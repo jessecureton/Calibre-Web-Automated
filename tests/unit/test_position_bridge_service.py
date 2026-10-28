@@ -171,3 +171,44 @@ class TestKosyncToKobo:
                                55.0, NOW, files)
         assert (d.forward, d.reason) == (False, "untranslatable")
         assert kobo_bookmark(session) is None
+
+
+@pytest.mark.unit
+class TestLanding:
+    """A reader opening at a pushed position reports its own page start, a little earlier."""
+    SENT_FROM_KOBO = "kobo.2.1"                               # "Everything was in confusion..."
+    PAGE_START = "/body/DocFragment[2]/body/p[1]/text().20"   # mid "Happy families..."
+    READ_ON = "/body/DocFragment[2]/body/p[4]/text().4"       # "The wife had discovered..."
+
+    def test_readest_page_start_before_pushed_position_is_quiet(self, session, files):
+        on_kobo_state(session, USER, BOOK, bookmark(self.SENT_FROM_KOBO), NOW, files)
+        d = on_kosync_progress(session, USER, BOOK, self.PAGE_START, 41.0,
+                               NOW + timedelta(minutes=1), files)
+        assert (d.forward, d.reason) == (False, "landing")
+        assert kobo_bookmark(session) is None
+
+    def test_reading_on_after_landing_is_a_move(self, session, files):
+        on_kobo_state(session, USER, BOOK, bookmark(self.SENT_FROM_KOBO), NOW, files)
+        on_kosync_progress(session, USER, BOOK, self.PAGE_START, 41.0, NOW + timedelta(minutes=1), files)
+        d = on_kosync_progress(session, USER, BOOK, self.READ_ON, 43.0, NOW + timedelta(minutes=5), files)
+        assert (d.forward, d.reason) == (True, "moved")
+
+    def test_real_phone_move_ends_landing(self, session, files):
+        on_kobo_state(session, USER, BOOK, bookmark(self.SENT_FROM_KOBO), NOW, files)
+        on_kosync_progress(session, USER, BOOK, self.READ_ON, 43.0, NOW + timedelta(minutes=5), files)
+        d = on_kosync_progress(session, USER, BOOK, self.PAGE_START, 41.0,
+                               NOW + timedelta(minutes=9), files)
+        assert (d.forward, d.reason) == (True, "moved")
+
+    def test_landing_needs_same_chapter(self, session, files):
+        on_kobo_state(session, USER, BOOK, bookmark(self.SENT_FROM_KOBO), NOW, files)
+        d = on_kosync_progress(session, USER, BOOK, "/body/DocFragment[1]/body/p[3]/text().0",
+                               5.0, NOW + timedelta(minutes=1), files)
+        assert (d.forward, d.reason) == (True, "moved")
+
+    def test_kobo_page_start_before_pushed_span_is_quiet(self, session, files):
+        on_kosync_progress(session, USER, BOOK, TestKosyncToKobo.XP, 80.0, NOW, files)
+        d = on_kobo_state(session, USER, BOOK, bookmark("kobo.2.1", when="2026-10-28T18:05:00Z"),
+                          NOW + timedelta(minutes=5), files)
+        assert (d.forward, d.reason) == (False, "landing")
+        assert kosync_rows(session) == []

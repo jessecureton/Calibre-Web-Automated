@@ -154,6 +154,14 @@ class TestDecideKobo:
         d = decide_kobo(row(kosync_received=X1), K1, NOW, X1)
         assert (d.forward, d.reason) == (False, "already-there")
 
+    def test_landing_is_not_move(self):
+        d = decide_kobo(row(kobo_sent=K2), K1, NOW, X1, landing=True)
+        assert (d.forward, d.reason) == (False, "landing")
+
+    def test_not_moved_wins_over_landing(self):
+        d = decide_kobo(row(kobo_sent=K1), K1, NOW, X1, landing=True)
+        assert d.reason == "not-moved"
+
     def test_backward_move_forwarded(self):
         r = row(kobo_received=K2, kosync_sent=X2)
         d = decide_kobo(r, K_EARLIER, NOW, "/body/DocFragment[2]/body/p[4]/text().0")
@@ -180,6 +188,10 @@ class TestDecideKosync:
     def test_moved(self):
         d = decide_kosync(row(kosync_received=X1, kobo_sent=K1), X2, K2)
         assert (d.forward, d.reason) == (True, "moved")
+
+    def test_landing_is_not_move(self):
+        d = decide_kosync(row(kosync_sent=X2), X1, K1, landing=True)
+        assert (d.forward, d.reason) == (False, "landing")
 
 
 @pytest.mark.unit

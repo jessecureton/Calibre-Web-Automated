@@ -23,8 +23,17 @@ from ... import logger
 from ... import ub
 from ..models import KOSyncProgress
 from .book import EpubBook, content_digest
-from .state import Decision, PositionBridgeState, decide_kobo, decide_kosync, parse_kobo_time
+from .state import (
+    LANDING_CHARS,
+    Decision,
+    PositionBridgeState,
+    _utc,
+    decide_kobo,
+    decide_kosync,
+    parse_kobo_time,
+)
 from .translate import kobo_to_xpointer, xpointer_to_kobo
+from .xpointer import parse_xpointer
 
 log = logger.create()
 
@@ -76,6 +85,39 @@ def _note(user_id: int, book_id: int, side: str, decision: Decision) -> Decision
     return decision
 
 
+def _lands_before(sent: Optional[int], reported: Optional[int]) -> bool:
+    return sent is not None and reported is not None and 0 <= sent - reported <= LANDING_CHARS
+
+
+def _kobo_landing(row: Optional[PositionBridgeState], kepub: EpubBook, source: str, span: str) -> bool:
+    """Whether the Kobo reports the page start around the span we just pushed to it."""
+    if row is None or not row.kobo_sent or row.kosync_received_at is None:
+        return False
+    if row.kobo_received_at is not None and _utc(row.kobo_received_at) > _utc(row.kosync_received_at):
+        return False  # the Kobo has really moved since the push
+    sent_source, _, sent_span = row.kobo_sent.partition('#')
+    if sent_source != source:
+        return False
+    stream = kepub.span_stream(source)
+    return _lands_before(stream.offset_of(sent_span), stream.offset_of(span))
+
+
+def _kosync_landing(row: Optional[PositionBridgeState], epub: EpubBook, xpointer: str) -> bool:
+    """Whether the KOReader sync client reports the page start around the position we just sent."""
+    if row is None or not row.kosync_sent or row.kobo_received_at is None:
+        return False
+    if row.kosync_received_at is not None and _utc(row.kosync_received_at) > _utc(row.kobo_received_at):
+        return False  # the client has really moved since the send
+    try:
+        sent, reported = parse_xpointer(row.kosync_sent), parse_xpointer(xpointer)
+    except ValueError:
+        return False
+    if sent.fragment != reported.fragment or not 0 < sent.fragment <= len(epub.spine):
+        return False
+    chapter = epub.chapter_text(epub.spine[sent.fragment - 1])
+    return _lands_before(chapter.offset_of(sent), chapter.offset_of(reported))
+
+
 def _stale(row: Optional[PositionBridgeState], kepub_path: str) -> bool:
     return bool(row and row.kobo_copy_digest and row.kobo_copy_digest != content_digest(kepub_path))
 
@@ -98,10 +140,12 @@ def on_kobo_state(session, user_id: int, book_id: int, bookmark: dict, now: date
     read_at = parse_kobo_time(bookmark.get("LastModified"), now)
     translated = kobo_to_xpointer(epub, kepub, source, location["Value"])
     row = _state(session, user_id, book_id)
-    decision = decide_kobo(row, key, read_at, translated)
-    if decision.reason != "not-moved":
+    landing = _kobo_landing(row, kepub, source, location["Value"])
+    decision = decide_kobo(row, key, read_at, translated, landing)
+    if decision.reason not in ("not-moved", "landing"):
         row.kobo_received = key
-        row.kobo_received_at = read_at
+    if decision.forward or decision.reason == "older-than-other-move":
+        row.kobo_received_at = read_at  # only real readings date a move
     if decision.forward:
         progress = session.query(KOSyncProgress).filter(
             KOSyncProgress.user_id == user_id,
@@ -145,12 +189,15 @@ def on_kosync_progress(session, user_id: int, book_id: int, xpointer: str, perce
     if _stale(_existing_state(session, user_id, book_id), kepub_path):
         return _note(user_id, book_id, "kosync", Decision(False, "stale-kobo-copy"))
 
-    location = xpointer_to_kobo(EpubBook(epub_path), EpubBook(kepub_path), xpointer)
+    epub = EpubBook(epub_path)
+    location = xpointer_to_kobo(epub, EpubBook(kepub_path), xpointer)
     row = _state(session, user_id, book_id)
-    decision = decide_kosync(row, xpointer, location.key() if location else None)
-    if decision.reason != "not-moved":
+    landing = _kosync_landing(row, epub, xpointer)
+    decision = decide_kosync(row, xpointer, location.key() if location else None, landing)
+    if decision.reason not in ("not-moved", "landing"):
         row.kosync_received = xpointer
-        row.kosync_received_at = now
+    if decision.forward:
+        row.kosync_received_at = now  # only real readings date a move
     if decision.forward:
         state = _reading_state(session, user_id, book_id)
         bookmark = state.current_bookmark
