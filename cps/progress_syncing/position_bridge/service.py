@@ -16,7 +16,7 @@ Each function commits its own changes.
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Optional, Tuple
 
 from ... import logger
@@ -32,7 +32,7 @@ from .state import (
     decide_kosync,
     parse_kobo_time,
 )
-from .translate import kobo_to_xpointer, xpointer_to_kobo
+from .translate import KoboLocation, kobo_to_xpointer, xpointer_to_kobo
 from .xpointer import parse_xpointer
 
 log = logger.create()
@@ -160,8 +160,35 @@ def on_kobo_state(session, user_id: int, book_id: int, bookmark: dict, now: date
         progress.device_id = KOSYNC_DEVICE_ID
         progress.timestamp = now
         row.kosync_sent = translated
+    elif _push_pending(row, decision, key):
+        # HandleStateRequest just stored this report over a push the Kobo hasn't
+        # received; put the push back so the Kobo's next sync still gets it.
+        pushed = _sent_location(kepub, row.kobo_sent)
+        if pushed is not None:
+            _push_to_kobo(session, user_id, book_id, pushed, row.kobo_sent_percent)
+            log.info(f"[position-bridge] user={user_id} book={book_id} side=kobo "
+                     f"kept pushed position {row.kobo_sent} over {decision.reason} report")
     session.commit()
     return _note(user_id, book_id, "kobo", decision)
+
+
+def _push_pending(row: PositionBridgeState, decision: Decision, key: str) -> bool:
+    """Whether a declined Kobo report would overwrite a newer push the Kobo hasn't taken."""
+    if not row.kobo_sent or key == row.kobo_sent or row.kosync_received_at is None:
+        return False
+    if row.kobo_received_at is not None and _utc(row.kobo_received_at) > _utc(row.kosync_received_at):
+        return False  # the Kobo has really moved since the push
+    return decision.reason == "older-than-other-move" or \
+        (decision.reason == "not-moved" and key == row.kobo_received)
+
+
+def _sent_location(kepub: EpubBook, sent: str) -> Optional[KoboLocation]:
+    source, _, span = sent.partition('#')
+    stream = kepub.span_stream(source)
+    offset = stream.offset_of(span)
+    if offset is None:
+        return None
+    return KoboLocation(source, span, offset / max(len(stream.text), 1))
 
 
 def _reading_state(session, user_id: int, book_id: int):
@@ -178,6 +205,24 @@ def _reading_state(session, user_id: int, book_id: int):
         state.statistics = ub.KoboStatistics()
         book_read.kobo_reading_state = state
     return book_read.kobo_reading_state
+
+
+def _push_to_kobo(session, user_id: int, book_id: int, location: KoboLocation,
+                  percentage: Optional[float]) -> None:
+    state = _reading_state(session, user_id, book_id)
+    bookmark = state.current_bookmark
+    bookmark.location_source = location.source
+    bookmark.location_type = "KoboSpan"
+    bookmark.location_value = location.span
+    bookmark.progress_percent = percentage
+    bookmark.content_source_progress_percent = location.chapter_fraction * 100
+    session.flush()
+    # Nickel resumes at a pushed location only when LastModified moves and
+    # PriorityTimestamp equals it. Stamp it now, not with the request's start, so a
+    # Kobo sync that ran meanwhile can't have moved its token past the push.
+    pushed_at = datetime.now(timezone.utc)
+    state.last_modified = pushed_at
+    state.priority_timestamp = pushed_at
 
 
 def on_kosync_progress(session, user_id: int, book_id: int, xpointer: str, percentage: float,
@@ -199,19 +244,9 @@ def on_kosync_progress(session, user_id: int, book_id: int, xpointer: str, perce
     if decision.forward:
         row.kosync_received_at = now  # only real readings date a move
     if decision.forward:
-        state = _reading_state(session, user_id, book_id)
-        bookmark = state.current_bookmark
-        bookmark.location_source = location.source
-        bookmark.location_type = "KoboSpan"
-        bookmark.location_value = location.span
-        bookmark.progress_percent = percentage
-        bookmark.content_source_progress_percent = location.chapter_fraction * 100
-        session.flush()
-        # Nickel resumes at a pushed location only when LastModified moves and
-        # PriorityTimestamp equals it.
-        state.last_modified = now
-        state.priority_timestamp = now
+        _push_to_kobo(session, user_id, book_id, location, percentage)
         row.kobo_sent = location.key()
+        row.kobo_sent_percent = percentage
     session.commit()
     return _note(user_id, book_id, "kosync", decision)
 

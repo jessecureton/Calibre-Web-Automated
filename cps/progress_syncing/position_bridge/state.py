@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 
 from ... import logger
 from ...ub import Base as AppBase
@@ -34,6 +34,7 @@ class PositionBridgeState(AppBase):
         kobo_received: last Kobo position received, "<zip path>#<kobo span id>"
         kobo_received_at: when the reading behind kobo_received happened
         kobo_sent: last position pushed to the Kobo, same form as kobo_received
+        kobo_sent_percent: the book percentage pushed with kobo_sent
         kosync_received: last XPointer received over KOReader sync
         kosync_received_at: when kosync_received arrived
         kosync_sent: last XPointer written for KOReader sync clients
@@ -51,6 +52,7 @@ class PositionBridgeState(AppBase):
     kosync_received = Column(String)
     kosync_received_at = Column(DateTime)
     kosync_sent = Column(String)
+    kobo_sent_percent = Column(Float)
 
     def __repr__(self):
         return f'<PositionBridgeState user={self.user_id} book={self.book_id}>'
@@ -76,6 +78,7 @@ def ensure_position_bridge_table(conn):
                 kosync_received TEXT,
                 kosync_received_at TIMESTAMP,
                 kosync_sent TEXT,
+                kobo_sent_percent REAL,
                 UNIQUE (user_id, book_id),
                 FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
             )

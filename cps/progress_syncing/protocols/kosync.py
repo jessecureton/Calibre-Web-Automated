@@ -397,7 +397,12 @@ def update_book_read_status(user, book_id: int, percentage: float,
         else:
             log.debug(f"ReadBook status unchanged: {old_status}")
 
-        book_read.last_modified = datetime.now(timezone.utc)
+        # Touching ReadBook bumps the Kobo reading state's timestamps (ub.py's
+        # before_flush listener), which the Kobo reads as "resume at the stored
+        # bookmark". With the position bridge deciding Kobo pushes, only a real
+        # status change may do that.
+        if touch_kobo_bookmark or old_status != new_status:
+            book_read.last_modified = datetime.now(timezone.utc)
 
         # Update KoboBookmark progress_percent if it exists (the position bridge,
         # when enabled, writes a full Kobo location instead)

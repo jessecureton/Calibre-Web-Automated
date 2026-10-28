@@ -212,3 +212,74 @@ class TestLanding:
                           NOW + timedelta(minutes=5), files)
         assert (d.forward, d.reason) == (False, "landing")
         assert kosync_rows(session) == []
+
+
+def kobo_put(session, files, bm, now=NOW):
+    """What HandleStateRequest does before the bridge runs: store the Kobo's report as-is."""
+    book_read = session.query(ub.ReadBook).filter(
+        ub.ReadBook.user_id == USER, ub.ReadBook.book_id == BOOK).one_or_none()
+    if book_read is None:
+        book_read = ub.ReadBook(user_id=USER, book_id=BOOK)
+        session.add(book_read)
+    if book_read.kobo_reading_state is None:
+        state = ub.KoboReadingState(user_id=USER, book_id=BOOK)
+        state.current_bookmark = ub.KoboBookmark()
+        state.statistics = ub.KoboStatistics()
+        book_read.kobo_reading_state = state
+    mark = book_read.kobo_reading_state.current_bookmark
+    location = bm["Location"]
+    mark.location_source, mark.location_type, mark.location_value = \
+        location["Source"], location["Type"], location["Value"]
+    mark.progress_percent = bm["ProgressPercent"]
+    session.commit()
+    return on_kobo_state(session, USER, BOOK, bm, now, files)
+
+
+@pytest.mark.unit
+class TestKeepPushedPosition:
+    """A Kobo report the bridge declines must not erase a push the Kobo hasn't received."""
+    XP = "/body/DocFragment[2]/body/p[4]/text().4"   # pushed as kobo.4.1
+
+    def assert_pushed(self, session, since):
+        state = kobo_bookmark(session)
+        bm = state.current_bookmark
+        assert (bm.location_source, bm.location_value) == (CH2_PATH, "kobo.4.1")
+        assert bm.progress_percent == 80.0
+        assert state.last_modified == state.priority_timestamp
+        assert state.last_modified.replace(tzinfo=timezone.utc) >= since
+
+    def test_late_kobo_report_keeps_push(self, session, files):
+        on_kosync_progress(session, USER, BOOK, self.XP, 80.0, NOW, files)
+        since = datetime.now(timezone.utc).replace(microsecond=0)
+        d = kobo_put(session, files, bookmark("kobo.1.1", percent=30.0, when="2026-10-28T17:50:00Z"))
+        assert d.reason == "older-than-other-move"
+        self.assert_pushed(session, since)
+
+    def test_kobo_reopening_its_old_spot_keeps_push(self, session, files):
+        kobo_put(session, files, bookmark("kobo.1.1", percent=30.0, when="2026-10-28T17:59:00Z"))
+        on_kosync_progress(session, USER, BOOK, self.XP, 80.0, NOW + timedelta(minutes=1), files)
+        since = datetime.now(timezone.utc).replace(microsecond=0)
+        d = kobo_put(session, files, bookmark("kobo.1.1", percent=30.0, when="2026-10-28T18:10:00Z"),
+                     now=NOW + timedelta(minutes=10))
+        assert d.reason == "not-moved"
+        self.assert_pushed(session, since)
+
+    def test_kobo_reading_on_after_push_wins(self, session, files):
+        on_kosync_progress(session, USER, BOOK, "/body/DocFragment[2]/body/p[2]/text().4", 40.0, NOW, files)
+        d = kobo_put(session, files, bookmark("kobo.4.1", percent=45.0, when="2026-10-28T18:10:00Z"),
+                     now=NOW + timedelta(minutes=10))
+        assert d.forward
+        assert kobo_bookmark(session).current_bookmark.location_value == "kobo.4.1"
+
+    def test_landing_is_left_alone(self, session, files):
+        on_kosync_progress(session, USER, BOOK, self.XP, 80.0, NOW, files)
+        d = kobo_put(session, files, bookmark("kobo.2.1", percent=79.0, when="2026-10-28T18:05:00Z"),
+                     now=NOW + timedelta(minutes=5))
+        assert d.reason == "landing"
+        assert kobo_bookmark(session).current_bookmark.location_value == "kobo.2.1"
+
+    def test_push_is_stamped_when_written(self, session, files):
+        since = datetime.now(timezone.utc).replace(microsecond=0)
+        on_kosync_progress(session, USER, BOOK, self.XP, 80.0, NOW - timedelta(days=1), files)
+        state = kobo_bookmark(session)
+        assert state.last_modified.replace(tzinfo=timezone.utc) >= since

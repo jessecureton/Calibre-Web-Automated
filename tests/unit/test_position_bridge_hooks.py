@@ -87,3 +87,13 @@ class TestUpdateBookReadStatus:
         session.commit()
         read = session.query(ub.ReadBook).filter(ub.ReadBook.book_id == 2).one()
         assert read.kobo_reading_state.current_bookmark.progress_percent is None
+
+    def test_touch_false_leaves_reading_state_alone(self, session):
+        update_book_read_status(SimpleNamespace(id=3), 1, 55.0, touch_kobo_bookmark=False)
+        session.commit()
+        state = session.query(ub.KoboReadingState).one()
+        before = (state.last_modified, state.priority_timestamp)
+        update_book_read_status(SimpleNamespace(id=3), 1, 56.0, touch_kobo_bookmark=False)
+        session.commit()
+        session.refresh(state)
+        assert (state.last_modified, state.priority_timestamp) == before

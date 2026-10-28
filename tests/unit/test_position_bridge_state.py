@@ -53,7 +53,7 @@ class TestEnsurePositionBridgeTable:
     EXPECTED = {
         "id", "user_id", "book_id", "kobo_copy_digest",
         "kobo_received", "kobo_received_at", "kobo_sent",
-        "kosync_received", "kosync_received_at", "kosync_sent",
+        "kosync_received", "kosync_received_at", "kosync_sent", "kobo_sent_percent",
     }
 
     def test_ensure_table_idempotent(self):
