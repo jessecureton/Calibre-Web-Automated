@@ -1310,6 +1310,14 @@ def do_download_file(book, book_format, client, data, headers):
             log.error(f"Failed to calculate/store checksum for book {book.id}: {e}")
             # Don't fail the download if checksum calculation fails
 
+    # Remember which KEPUB this user's Kobo holds, for position translation
+    if client == "kobo" and book_format == "kepub" and not config.config_use_google_drive:
+        library_kepub = os.path.join(config.get_book_path(), book.path, book_name + ".kepub")
+        if os.path.isfile(library_kepub):
+            from .progress_syncing.position_bridge import run_bridge
+            from .progress_syncing.position_bridge.service import record_kobo_download
+            run_bridge(record_kobo_download, ub.session, current_user.id, book.id, library_kepub)
+
     response = make_response(send_from_directory(filename, download_name + "." + book_format))
     # ToDo Check headers parameter
     for element in headers:

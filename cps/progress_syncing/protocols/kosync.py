@@ -52,7 +52,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from ... import logger, ub, csrf, config, constants, services, usermanagement
 from ...render_template import render_title_template
 from ..models import KOSyncProgress
-from ..settings import is_koreader_sync_enabled
+from ..settings import is_koreader_sync_enabled, is_position_bridge_enabled
+from ..position_bridge import run_bridge
+from ..position_bridge.service import on_kosync_progress
 
 log = logger.create()
 
@@ -329,7 +331,8 @@ def enrich_response_with_book_info(response_data: Dict[str, Any], document_check
     return response_data, book_id, book_format, book_title, checksum_version
 
 
-def update_book_read_status(user, book_id: int, percentage: float) -> None:
+def update_book_read_status(user, book_id: int, percentage: float,
+                            touch_kobo_bookmark: bool = True) -> None:
     """
     Update the user's ReadBook status based on reading progress percentage.
 
@@ -396,8 +399,10 @@ def update_book_read_status(user, book_id: int, percentage: float) -> None:
 
         book_read.last_modified = datetime.now(timezone.utc)
 
-        # Update KoboBookmark progress_percent if it exists
-        if book_read.kobo_reading_state and book_read.kobo_reading_state.current_bookmark:
+        # Update KoboBookmark progress_percent if it exists (the position bridge,
+        # when enabled, writes a full Kobo location instead)
+        if touch_kobo_bookmark and book_read.kobo_reading_state \
+                and book_read.kobo_reading_state.current_bookmark:
             book_read.kobo_reading_state.current_bookmark.progress_percent = percentage
             book_read.kobo_reading_state.current_bookmark.last_modified = datetime.now(timezone.utc)
 
@@ -424,7 +429,8 @@ def update_book_read_status(user, book_id: int, percentage: float) -> None:
             book_id=book_id
         )
         kobo_reading_state.current_bookmark = ub.KoboBookmark()
-        kobo_reading_state.current_bookmark.progress_percent = percentage
+        if touch_kobo_bookmark:
+            kobo_reading_state.current_bookmark.progress_percent = percentage
         kobo_reading_state.statistics = ub.KoboStatistics()
         book_read.kobo_reading_state = kobo_reading_state
 
@@ -752,7 +758,8 @@ def update_progress():
         # This is done AFTER kosync_progress is committed, so sync location is always safe
         if book_id:
             try:
-                update_book_read_status(user, book_id, percentage_float)
+                update_book_read_status(user, book_id, percentage_float,
+                                        touch_kobo_bookmark=not is_position_bridge_enabled())
                 ub.session.commit()
                 log.info(f"Updated ReadBook status: user={user.id}, book={book_id} "
                         f"({book_title}), status based on {percentage_float:.1f}%")
@@ -775,6 +782,10 @@ def update_progress():
             except Exception as e:
                 log.error(f"Unexpected error updating ReadBook status for book {book_id}: {e}")
                 ub.session.rollback()
+
+            # Translate the position for the user's Kobo (no-op unless enabled)
+            run_bridge(on_kosync_progress, ub.session, user.id, book_id, progress,
+                       percentage_float, timestamp)
 
         log.debug(endpoint + f" Response: {response_data}")
 

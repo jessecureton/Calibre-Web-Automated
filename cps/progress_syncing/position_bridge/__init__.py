@@ -14,3 +14,29 @@ other by matching the text at the position, and decides which reports are real
 moves worth forwarding. It is off unless the admin enables
 `kobo_kosync_position_bridge` alongside KOReader sync.
 """
+
+import traceback
+
+from ... import logger, ub
+from ..settings import is_position_bridge_enabled
+
+log = logger.create()
+
+
+def run_bridge(fn, *args, **kwargs) -> None:
+    """Call a bridge function from a request handler, if the bridge is enabled.
+
+    Any error is logged and rolled back, never raised: the bridge must not
+    change the outcome of the Kobo or KOReader sync request it rides along with.
+    """
+    if not is_position_bridge_enabled():
+        return
+    try:
+        fn(*args, **kwargs)
+    except Exception:
+        log.error("[position-bridge] %s failed:\n%s", getattr(fn, '__name__', fn),
+                  traceback.format_exc())
+        try:
+            ub.session.rollback()
+        except Exception:
+            pass

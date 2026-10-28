@@ -46,6 +46,8 @@ from .helper import get_download_link
 from .services import SyncToken as SyncToken, hardcover
 from .web import download_required
 from .kobo_auth import requires_kobo_auth, get_auth_token
+from .progress_syncing.position_bridge import run_bridge
+from .progress_syncing.position_bridge.service import on_kobo_state
 
 KOBO_FORMATS = {"KEPUB": ["KEPUB"], "EPUB": ["EPUB3", "EPUB"]}
 KOBO_STOREAPI_URL = "https://storeapi.kobo.com"
@@ -1004,6 +1006,10 @@ def HandleStateRequest(book_uuid):
 
         ub.session.merge(kobo_reading_state)
         ub.session_commit()
+        if request_bookmark:
+            # Translate the position for KOReader sync clients (no-op unless enabled)
+            run_bridge(on_kobo_state, ub.session, current_user.id, book.id, request_bookmark,
+                       datetime.now(timezone.utc))
         return jsonify({
             "RequestResult": "Success",
             "UpdateResults": [update_results_response],
