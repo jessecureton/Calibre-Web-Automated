@@ -95,3 +95,106 @@ def test_setting_defaults_off_in_cwa_db(tmp_path, monkeypatch):
 
     settings = CWA_DB().cwa_settings
     assert settings["kobo_kosync_position_bridge"] == 0
+
+
+from datetime import datetime, timedelta, timezone
+
+from cps.progress_syncing.position_bridge.state import (
+    PositionBridgeState,
+    decide_kobo,
+    decide_kosync,
+    parse_kobo_time,
+)
+
+NOW = datetime(2026, 10, 28, 18, 0, 0, tzinfo=timezone.utc)
+K1 = "OEBPS/ch6.xhtml#kobo.19.1"
+K2 = "OEBPS/ch6.xhtml#kobo.24.3"
+K_EARLIER = "OEBPS/ch2.xhtml#kobo.4.1"
+X1 = "/body/DocFragment[6]/body/section/p[19]/text().0"
+X2 = "/body/DocFragment[6]/body/section/p[24]/text().11"
+
+
+def row(**fields):
+    return PositionBridgeState(user_id=3, book_id=316, **fields)
+
+
+@pytest.mark.unit
+class TestDecideKobo:
+    def test_first_report_with_no_row(self):
+        assert decide_kobo(None, K1, NOW, X1).forward is True
+
+    def test_open_is_not_move(self):
+        d = decide_kobo(row(kobo_sent=K1), K1, NOW, X1)
+        assert (d.forward, d.reason) == (False, "not-moved")
+
+    def test_repeat_of_last_received_is_not_move(self):
+        d = decide_kobo(row(kobo_received=K1), K1, NOW, X1)
+        assert (d.forward, d.reason) == (False, "not-moved")
+
+    def test_late_kobo_report_not_forwarded(self):
+        r = row(kosync_received=X2, kosync_received_at=NOW)
+        d = decide_kobo(r, K1, NOW - timedelta(minutes=5), X1)
+        assert (d.forward, d.reason) == (False, "older-than-other-move")
+
+    def test_drift_tolerated(self):
+        r = row(kosync_received=X2, kosync_received_at=NOW)
+        d = decide_kobo(r, K1, NOW - timedelta(seconds=30), X1)
+        assert (d.forward, d.reason) == (True, "moved")
+
+    def test_naive_stored_time_is_utc(self):
+        r = row(kosync_received=X2, kosync_received_at=NOW.replace(tzinfo=None))
+        d = decide_kobo(r, K1, NOW - timedelta(minutes=5), X1)
+        assert d.reason == "older-than-other-move"
+
+    def test_untranslatable(self):
+        d = decide_kobo(row(), K1, NOW, None)
+        assert (d.forward, d.reason) == (False, "untranslatable")
+
+    def test_already_there(self):
+        d = decide_kobo(row(kosync_received=X1), K1, NOW, X1)
+        assert (d.forward, d.reason) == (False, "already-there")
+
+    def test_backward_move_forwarded(self):
+        r = row(kobo_received=K2, kosync_sent=X2)
+        d = decide_kobo(r, K_EARLIER, NOW, "/body/DocFragment[2]/body/p[4]/text().0")
+        assert (d.forward, d.reason) == (True, "moved")
+
+
+@pytest.mark.unit
+class TestDecideKosync:
+    def test_first_report_with_no_row(self):
+        assert decide_kosync(None, X1, K1).forward is True
+
+    def test_open_is_not_move(self):
+        d = decide_kosync(row(kosync_sent=X1), X1, K1)
+        assert (d.forward, d.reason) == (False, "not-moved")
+
+    def test_untranslatable(self):
+        d = decide_kosync(row(), X1, None)
+        assert (d.forward, d.reason) == (False, "untranslatable")
+
+    def test_already_there(self):
+        d = decide_kosync(row(kobo_sent=K1), X1, K1)
+        assert (d.forward, d.reason) == (False, "already-there")
+
+    def test_moved(self):
+        d = decide_kosync(row(kosync_received=X1, kobo_sent=K1), X2, K2)
+        assert (d.forward, d.reason) == (True, "moved")
+
+
+@pytest.mark.unit
+class TestParseKoboTime:
+    def test_z_suffix(self):
+        assert parse_kobo_time("2026-10-28T15:28:33Z", NOW) == datetime(2026, 10, 28, 15, 28, 33, tzinfo=timezone.utc)
+
+    def test_fractional_seconds(self):
+        got = parse_kobo_time("2026-10-28T15:28:33.4439690Z", NOW)
+        assert got.replace(microsecond=0) == datetime(2026, 10, 28, 15, 28, 33, tzinfo=timezone.utc)
+
+    def test_offset(self):
+        got = parse_kobo_time("2026-10-28T10:28:33-05:00", NOW)
+        assert got == datetime(2026, 10, 28, 15, 28, 33, tzinfo=timezone.utc)
+
+    def test_kobo_time_falls_back_to_now(self):
+        assert parse_kobo_time(None, NOW) == NOW
+        assert parse_kobo_time("garbage", NOW) == NOW

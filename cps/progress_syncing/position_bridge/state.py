@@ -13,6 +13,11 @@ side and the last position sent to it, which is what tells a real move apart
 from a device merely reporting where it already was.
 """
 
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
 
 from ... import logger
@@ -78,3 +83,62 @@ def ensure_position_bridge_table(conn):
         conn.commit()
     except Exception as e:
         log.error(f"Could not create position_bridge_state table: {e}")
+
+
+# A Kobo report older than the latest KOReader sync move by more than this is
+# recorded but not forwarded. Tolerates modest Kobo clock drift.
+DRIFT = timedelta(seconds=60)
+
+
+@dataclass(frozen=True)
+class Decision:
+    forward: bool
+    reason: str
+    # one of "moved", "not-moved", "older-than-other-move", "already-there",
+    # "untranslatable", "stale-kobo-copy", "no-files"
+
+
+def _utc(value: datetime) -> datetime:
+    """SQLite hands back naive datetimes; CWA stores them in UTC."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def decide_kobo(row: Optional[PositionBridgeState], key: str, read_at: datetime,
+                translated: Optional[str]) -> Decision:
+    """Whether a Kobo position report ("<zip path>#<span>") is a move to forward."""
+    if row is not None and key in (row.kobo_received, row.kobo_sent):
+        return Decision(False, "not-moved")
+    if row is not None and row.kosync_received_at is not None \
+            and _utc(read_at) < _utc(row.kosync_received_at) - DRIFT:
+        return Decision(False, "older-than-other-move")
+    if translated is None:
+        return Decision(False, "untranslatable")
+    if row is not None and translated in (row.kosync_received, row.kosync_sent):
+        return Decision(False, "already-there")
+    return Decision(True, "moved")
+
+
+def decide_kosync(row: Optional[PositionBridgeState], xpointer: str,
+                  translated_key: Optional[str]) -> Decision:
+    """Whether a KOReader sync position report is a move to forward to the Kobo."""
+    if row is not None and xpointer in (row.kosync_received, row.kosync_sent):
+        return Decision(False, "not-moved")
+    if translated_key is None:
+        return Decision(False, "untranslatable")
+    if row is not None and translated_key in (row.kobo_received, row.kobo_sent):
+        return Decision(False, "already-there")
+    return Decision(True, "moved")
+
+
+def parse_kobo_time(value: Optional[str], now: datetime) -> datetime:
+    """A Kobo timestamp ("2026-10-28T15:28:33Z", fractional or offset forms) in UTC, else now."""
+    if not value:
+        return now
+    text = value.strip().replace('Z', '+00:00')
+    # Kobo sends up to 7 fractional digits; fromisoformat takes at most 6.
+    text = re.sub(r'(\.\d{6})\d+', r'\1', text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return now
+    return _utc(parsed).astimezone(timezone.utc)
