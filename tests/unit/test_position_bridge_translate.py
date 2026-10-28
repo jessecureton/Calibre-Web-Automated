@@ -163,8 +163,8 @@ class TestAnnaKarenina:
             stream = SpanStream(kepub.chapter(path))
             ends = [s for _, s in stream.spans[1:]] + [len(stream.text)]
             for (span, start), end in zip(stream.spans, ends):
-                if end == start:
-                    continue
+                if not stream.text[start:end].strip():
+                    continue  # empty or whitespace-only spans hold no position of their own
                 xp = kobo_to_xpointer(epub, kepub, path, span)
                 back = xp and xpointer_to_kobo(epub, kepub, xp)
                 if not back or back.span != span:
