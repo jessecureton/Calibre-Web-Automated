@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS cwa_settings(
     kindle_epub_fixer SMALLINT DEFAULT 1 NOT NULL,
     kindle_epub_fixer_aggressive SMALLINT DEFAULT 0 NOT NULL,
     koreader_sync_enabled SMALLINT DEFAULT 0 NOT NULL,
+    kobo_kosync_position_bridge SMALLINT DEFAULT 0 NOT NULL,
     auto_backup_epub_fixes SMALLINT DEFAULT 1 NOT NULL,
     archived_cleanup_enabled SMALLINT DEFAULT 1 NOT NULL,
     archived_cleanup_schedule TEXT DEFAULT 'daily' NOT NULL,

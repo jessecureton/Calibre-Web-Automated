@@ -40,3 +40,17 @@ def is_koreader_sync_enabled() -> bool:
     except Exception:
         # Fail closed to avoid unexpected DB writes when setting is missing
         return False
+
+
+def is_position_bridge_enabled() -> bool:
+    """Return True if Kobo <-> KOReader sync position translation is enabled.
+
+    The bridge does nothing unless KOReader sync itself is enabled.
+    """
+    try:
+        from cwa_db import CWA_DB
+        settings = CWA_DB().cwa_settings
+        return bool(settings.get('koreader_sync_enabled', 0)) and \
+            bool(settings.get('kobo_kosync_position_bridge', 0))
+    except Exception:
+        return False
