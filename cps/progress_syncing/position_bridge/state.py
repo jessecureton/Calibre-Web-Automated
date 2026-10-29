@@ -38,6 +38,7 @@ class PositionBridgeState(AppBase):
         kosync_received: last XPointer received over KOReader sync
         kosync_received_at: when kosync_received arrived
         kosync_sent: last XPointer written for KOReader sync clients
+        kosync_sent_percent: the book percentage written with kosync_sent
     """
     __tablename__ = 'position_bridge_state'
     __table_args__ = (UniqueConstraint('user_id', 'book_id'),)
@@ -53,6 +54,7 @@ class PositionBridgeState(AppBase):
     kosync_received_at = Column(DateTime)
     kosync_sent = Column(String)
     kobo_sent_percent = Column(Float)
+    kosync_sent_percent = Column(Float)
 
     def __repr__(self):
         return f'<PositionBridgeState user={self.user_id} book={self.book_id}>'
@@ -79,10 +81,16 @@ def ensure_position_bridge_table(conn):
                 kosync_received_at TIMESTAMP,
                 kosync_sent TEXT,
                 kobo_sent_percent REAL,
+                kosync_sent_percent REAL,
                 UNIQUE (user_id, book_id),
                 FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
             )
         """)
+        # Tables created by position-bridge.1 predate this column.
+        try:
+            execute_sql("ALTER TABLE position_bridge_state ADD COLUMN kosync_sent_percent REAL")
+        except Exception:
+            pass  # already there
         conn.commit()
     except Exception as e:
         log.error(f"Could not create position_bridge_state table: {e}")

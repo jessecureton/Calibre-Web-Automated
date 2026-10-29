@@ -147,19 +147,10 @@ def on_kobo_state(session, user_id: int, book_id: int, bookmark: dict, now: date
     if decision.forward or decision.reason == "older-than-other-move":
         row.kobo_received_at = read_at  # only real readings date a move
     if decision.forward:
-        progress = session.query(KOSyncProgress).filter(
-            KOSyncProgress.user_id == user_id,
-            KOSyncProgress.document == str(book_id),
-        ).first()
-        if progress is None:
-            progress = KOSyncProgress(user_id=user_id, document=str(book_id))
-            session.add(progress)
-        progress.progress = translated
-        progress.percentage = float(bookmark.get("ProgressPercent") or 0)
-        progress.device = KOSYNC_DEVICE
-        progress.device_id = KOSYNC_DEVICE_ID
-        progress.timestamp = now
+        percentage = float(bookmark.get("ProgressPercent") or 0)
+        _write_kosync(session, user_id, book_id, translated, percentage, now)
         row.kosync_sent = translated
+        row.kosync_sent_percent = percentage
     elif _push_pending(row, decision, key):
         # HandleStateRequest just stored this report over a push the Kobo hasn't
         # received; put the push back so the Kobo's next sync still gets it.
@@ -180,6 +171,22 @@ def _push_pending(row: PositionBridgeState, decision: Decision, key: str) -> boo
         return False  # the Kobo has really moved since the push
     return decision.reason == "older-than-other-move" or \
         (decision.reason == "not-moved" and key == row.kobo_received)
+
+
+def _write_kosync(session, user_id: int, book_id: int, xpointer: str,
+                  percentage: Optional[float], now: datetime) -> None:
+    progress = session.query(KOSyncProgress).filter(
+        KOSyncProgress.user_id == user_id,
+        KOSyncProgress.document == str(book_id),
+    ).first()
+    if progress is None:
+        progress = KOSyncProgress(user_id=user_id, document=str(book_id))
+        session.add(progress)
+    progress.progress = xpointer
+    progress.percentage = percentage or 0.0
+    progress.device = KOSYNC_DEVICE
+    progress.device_id = KOSYNC_DEVICE_ID
+    progress.timestamp = now
 
 
 def _sent_location(kepub: EpubBook, sent: str) -> Optional[KoboLocation]:
@@ -247,8 +254,24 @@ def on_kosync_progress(session, user_id: int, book_id: int, xpointer: str, perce
         _push_to_kobo(session, user_id, book_id, location, percentage)
         row.kobo_sent = location.key()
         row.kobo_sent_percent = percentage
+    elif _send_pending(row, decision, xpointer):
+        # The PUT handler just stored this report over a Kobo move the client hasn't
+        # taken; put the move back so the client's next pull still gets it.
+        _write_kosync(session, user_id, book_id, row.kosync_sent, row.kosync_sent_percent,
+                      datetime.now(timezone.utc))
+        log.info(f"[position-bridge] user={user_id} book={book_id} side=kosync "
+                 f"kept sent position {row.kosync_sent} over {decision.reason} report")
     session.commit()
     return _note(user_id, book_id, "kosync", decision)
+
+
+def _send_pending(row: PositionBridgeState, decision: Decision, xpointer: str) -> bool:
+    """Whether a declined KOReader sync report would overwrite a newer Kobo move the client hasn't taken."""
+    if not row.kosync_sent or xpointer == row.kosync_sent or row.kobo_received_at is None:
+        return False
+    if row.kosync_received_at is not None and _utc(row.kosync_received_at) > _utc(row.kobo_received_at):
+        return False  # the client has really moved since the send
+    return decision.reason == "not-moved" and xpointer == row.kosync_received
 
 
 def record_kobo_download(session, user_id: int, book_id: int, kepub_path: str) -> None:

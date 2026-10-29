@@ -283,3 +283,58 @@ class TestKeepPushedPosition:
         on_kosync_progress(session, USER, BOOK, self.XP, 80.0, NOW - timedelta(days=1), files)
         state = kobo_bookmark(session)
         assert state.last_modified.replace(tzinfo=timezone.utc) >= since
+
+
+def kosync_put(session, files, xpointer, percent, now):
+    """What the KOReader sync PUT handler does before the bridge runs: store the report as-is."""
+    progress = session.query(KOSyncProgress).filter(
+        KOSyncProgress.user_id == USER, KOSyncProgress.document == str(BOOK)).one_or_none()
+    if progress is None:
+        progress = KOSyncProgress(user_id=USER, document=str(BOOK))
+        session.add(progress)
+    progress.progress, progress.percentage = xpointer, percent
+    progress.device, progress.device_id = "Readest (iPhone)", "phone-1"
+    progress.timestamp = now
+    session.commit()
+    return on_kosync_progress(session, USER, BOOK, xpointer, percent, now, files)
+
+
+@pytest.mark.unit
+class TestKeepSentPosition:
+    """A KOReader sync report the bridge declines must not erase a Kobo move the client hasn't taken."""
+    PHONE_SPOT = "/body/DocFragment[1]/body/p[3]/text().0"
+    KOBO_MOVE = bookmark("kobo.4.1", percent=80.0, when="2026-10-28T18:05:00Z")
+
+    def setup_kobo_move(self, session, files):
+        kosync_put(session, files, self.PHONE_SPOT, 20.0, NOW)
+        kobo_put(session, files, self.KOBO_MOVE, now=NOW + timedelta(minutes=5))
+        return session.query(PositionBridgeState).one().kosync_sent
+
+    def test_phone_re_reporting_its_old_spot_keeps_kobo_move(self, session, files):
+        sent = self.setup_kobo_move(session, files)
+        since = datetime.now(timezone.utc).replace(microsecond=0)
+        d = kosync_put(session, files, self.PHONE_SPOT, 20.0, NOW + timedelta(minutes=6))
+        assert d.reason == "not-moved"
+        [row] = kosync_rows(session)
+        assert (row.progress, row.percentage, row.device_id) == (sent, 80.0, "cwa-position-bridge")
+        assert row.timestamp.replace(tzinfo=timezone.utc) >= since
+
+    def test_phone_reading_on_after_kobo_move_wins(self, session, files):
+        self.setup_kobo_move(session, files)
+        read_on = "/body/DocFragment[1]/body/p[1]/text().0"
+        d = kosync_put(session, files, read_on, 25.0, NOW + timedelta(minutes=6))
+        assert d.forward
+        assert kosync_rows(session)[0].progress == read_on
+
+    def test_landing_is_left_alone(self, session, files):
+        self.setup_kobo_move(session, files)
+        page_start = "/body/DocFragment[2]/body/p[2]/text().0"
+        d = kosync_put(session, files, page_start, 79.0, NOW + timedelta(minutes=6))
+        assert d.reason == "landing"
+        assert kosync_rows(session)[0].progress == page_start
+
+    def test_phone_already_at_kobo_move_is_left_alone(self, session, files):
+        sent = self.setup_kobo_move(session, files)
+        d = kosync_put(session, files, sent, 80.0, NOW + timedelta(minutes=6))
+        assert d.reason == "not-moved"
+        assert kosync_rows(session)[0].device_id == "phone-1"

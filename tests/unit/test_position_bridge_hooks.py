@@ -8,6 +8,8 @@
 
 from types import SimpleNamespace
 
+from datetime import datetime, timezone
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -97,3 +99,19 @@ class TestUpdateBookReadStatus:
         session.commit()
         session.refresh(state)
         assert (state.last_modified, state.priority_timestamp) == before
+
+
+@pytest.mark.unit
+class TestProgressTimestamp:
+    def test_stored_utc_time_is_served_as_utc_epoch_in_any_container_tz(self, monkeypatch):
+        import time
+        from cps.progress_syncing.protocols.kosync import epoch_seconds
+        monkeypatch.setenv("TZ", "America/New_York")
+        time.tzset()
+        try:
+            # SQLite hands back naive datetimes; CWA writes them in UTC.
+            assert epoch_seconds(datetime(2026, 10, 29, 3, 16, 18)) == 1793243778
+            assert epoch_seconds(datetime(2026, 10, 29, 3, 16, 18, tzinfo=timezone.utc)) == 1793243778
+        finally:
+            monkeypatch.delenv("TZ")
+            time.tzset()

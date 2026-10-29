@@ -54,7 +54,24 @@ class TestEnsurePositionBridgeTable:
         "id", "user_id", "book_id", "kobo_copy_digest",
         "kobo_received", "kobo_received_at", "kobo_sent",
         "kosync_received", "kosync_received_at", "kosync_sent", "kobo_sent_percent",
+        "kosync_sent_percent",
     }
+
+    def test_adds_columns_to_a_position_bridge_1_table(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE user (id INTEGER PRIMARY KEY)")
+        conn.execute("""CREATE TABLE position_bridge_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            book_id INTEGER NOT NULL, kobo_copy_digest TEXT, kobo_received TEXT,
+            kobo_received_at TIMESTAMP, kobo_sent TEXT, kosync_received TEXT,
+            kosync_received_at TIMESTAMP, kosync_sent TEXT, kobo_sent_percent REAL,
+            UNIQUE (user_id, book_id))""")
+        conn.execute("INSERT INTO position_bridge_state (user_id, book_id, kobo_sent) VALUES (3, 1, 'x')")
+        ensure_position_bridge_table(conn)
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(position_bridge_state)")}
+        assert columns == self.EXPECTED
+        assert conn.execute("SELECT kobo_sent FROM position_bridge_state").fetchall() == [("x",)]
 
     def test_ensure_table_idempotent(self):
         conn = sqlite3.connect(":memory:")

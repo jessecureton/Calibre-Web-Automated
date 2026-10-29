@@ -76,6 +76,14 @@ DEVICE_FIELD = "device"
 DEVICE_ID_FIELD = "device_id"
 TIMESTAMP_FIELD = "timestamp"
 
+
+def epoch_seconds(value: datetime) -> int:
+    """Unix time of a stored timestamp. SQLite hands back naive datetimes, written in UTC;
+    reading them as local time would skew them by the container's TZ offset."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return int(value.timestamp())
+
 # Validation constants
 MAX_DOCUMENT_LENGTH = 255  # Maximum document identifier length
 MAX_PROGRESS_LENGTH = 255  # Maximum progress string length
@@ -598,7 +606,7 @@ def get_progress(document: str):
             "percentage": percentage_decimal,
             "device": progress_record.device,
             "device_id": progress_record.device_id,
-            "timestamp": int(progress_record.timestamp.timestamp())
+            "timestamp": epoch_seconds(progress_record.timestamp)
         }
 
         response_data = {**response_data, **response_updates}
