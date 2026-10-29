@@ -1,5 +1,5 @@
-# Python runtime with CWA v4.0.7's dependencies, for running the test suite.
+# Python runtime with CWA v4.0.8's dependencies, for running the test suite.
 # The fork's source is mounted over /src at run time; nothing from this
 # image's own copy of CWA is tested.
-FROM crocodilestick/calibre-web-automated:v4.0.7
+FROM crocodilestick/calibre-web-automated:v4.0.8
 RUN /lsiopy/bin/pip install --no-cache-dir pytest

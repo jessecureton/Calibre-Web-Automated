@@ -1,6 +1,6 @@
 # Position bridge: end-to-end test on a Mac
 
-How `v4.0.7-position-bridge.1` was tested locally on 2026-10-28, so the run can be
+How the position bridge was first tested locally on 2026-10-28 (as `v4.0.7-position-bridge.1`), so the run can be
 repeated for the next build. Everything runs on localhost with throwaway data and
 CWA's documented default login (`admin` / `admin123`).
 
@@ -11,8 +11,8 @@ The cluster is amd64; build that tag for deploy:
 ```bash
 docker buildx build --platform linux/amd64 \
   --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --build-arg VERSION=v4.0.7-position-bridge.N \
-  -t docker.studs.house/calibre-web-automated:v4.0.7-position-bridge.N --load .
+  --build-arg VERSION=v4.0.8-position-bridge.N \
+  -t docker.studs.house/calibre-web-automated:v4.0.8-position-bridge.N --load .
 ```
 
 On Apple Silicon without Rosetta, kepubify crashes under qemu, so the first Kobo
@@ -22,7 +22,7 @@ same commit:
 ```bash
 docker buildx build --platform linux/arm64 \
   --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --build-arg VERSION=v4.0.7-position-bridge.N \
+  --build-arg VERSION=v4.0.8-position-bridge.N \
   -t cwa-position-bridge:e2e-arm64 --load .
 ```
 
