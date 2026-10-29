@@ -35,6 +35,7 @@ class PositionBridgeState(AppBase):
         kobo_received_at: when the reading behind kobo_received happened
         kobo_sent: last position pushed to the Kobo, same form as kobo_received
         kobo_sent_percent: the book percentage pushed with kobo_sent
+        kobo_prev_sent: the push kobo_sent replaced, while the Kobo may still report landing on it
         kosync_received: last XPointer received over KOReader sync
         kosync_received_at: when kosync_received arrived
         kosync_sent: last XPointer written for KOReader sync clients
@@ -55,6 +56,7 @@ class PositionBridgeState(AppBase):
     kosync_sent = Column(String)
     kobo_sent_percent = Column(Float)
     kosync_sent_percent = Column(Float)
+    kobo_prev_sent = Column(String)
 
     def __repr__(self):
         return f'<PositionBridgeState user={self.user_id} book={self.book_id}>'
@@ -82,15 +84,17 @@ def ensure_position_bridge_table(conn):
                 kosync_sent TEXT,
                 kobo_sent_percent REAL,
                 kosync_sent_percent REAL,
+                kobo_prev_sent TEXT,
                 UNIQUE (user_id, book_id),
                 FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
             )
         """)
-        # Tables created by position-bridge.1 predate this column.
-        try:
-            execute_sql("ALTER TABLE position_bridge_state ADD COLUMN kosync_sent_percent REAL")
-        except Exception:
-            pass  # already there
+        # Tables created by earlier position-bridge builds predate these columns.
+        for column in ("kosync_sent_percent REAL", "kobo_prev_sent TEXT"):
+            try:
+                execute_sql(f"ALTER TABLE position_bridge_state ADD COLUMN {column}")
+            except Exception:
+                pass  # already there
         conn.commit()
     except Exception as e:
         log.error(f"Could not create position_bridge_state table: {e}")

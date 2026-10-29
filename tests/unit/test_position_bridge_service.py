@@ -338,3 +338,35 @@ class TestKeepSentPosition:
         d = kosync_put(session, files, sent, 80.0, NOW + timedelta(minutes=6))
         assert d.reason == "not-moved"
         assert kosync_rows(session)[0].device_id == "phone-1"
+
+
+@pytest.mark.unit
+class TestLateKoboLanding:
+    """The Kobo may report landing on a push only after the phone has moved again.
+
+    Nickel stamps a report when it sends it, so that late landing looks newer than
+    the phone's move. It is still a landing, and the newer push must stand.
+    """
+    FIRST = "/body/DocFragment[2]/body/p[4]/text().4"    # pushed as ch2 kobo.4.1
+    SECOND = "/body/DocFragment[1]/body/p[3]/text().0"   # pushed as ch1 kobo.3.1
+
+    def test_late_landing_on_previous_push_keeps_newer_push(self, session, files):
+        on_kosync_progress(session, USER, BOOK, self.FIRST, 80.0, NOW, files)
+        on_kosync_progress(session, USER, BOOK, self.SECOND, 5.0, NOW + timedelta(minutes=5), files)
+        d = kobo_put(session, files, bookmark("kobo.2.1", percent=79.0, when="2026-10-28T18:05:01Z"),
+                     now=NOW + timedelta(minutes=5, seconds=1))
+        assert d.reason == "landing"
+        bm = kobo_bookmark(session).current_bookmark
+        assert (bm.location_source, bm.location_value) == ("OEBPS/text/ch1.xhtml", "kobo.3.1")
+        assert kosync_rows(session) == []
+
+    def test_kobo_reading_on_from_previous_push_still_wins(self, session, files):
+        on_kosync_progress(session, USER, BOOK, self.FIRST, 80.0, NOW, files)
+        kobo_put(session, files, bookmark("kobo.4.1", percent=80.0, when="2026-10-28T18:02:00Z"),
+                 now=NOW + timedelta(minutes=2))
+        kobo_put(session, files, bookmark("kobo.1.1", source="OEBPS/text/ch1.xhtml", percent=3.0,
+                                          when="2026-10-28T18:03:00Z"), now=NOW + timedelta(minutes=3))
+        on_kosync_progress(session, USER, BOOK, self.SECOND, 5.0, NOW + timedelta(minutes=5), files)
+        d = kobo_put(session, files, bookmark("kobo.2.1", percent=79.0, when="2026-10-28T18:06:00Z"),
+                     now=NOW + timedelta(minutes=6))
+        assert (d.forward, d.reason) == (True, "moved")

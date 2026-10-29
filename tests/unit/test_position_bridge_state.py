@@ -54,7 +54,7 @@ class TestEnsurePositionBridgeTable:
         "id", "user_id", "book_id", "kobo_copy_digest",
         "kobo_received", "kobo_received_at", "kobo_sent",
         "kosync_received", "kosync_received_at", "kosync_sent", "kobo_sent_percent",
-        "kosync_sent_percent",
+        "kosync_sent_percent", "kobo_prev_sent",
     }
 
     def test_adds_columns_to_a_position_bridge_1_table(self):

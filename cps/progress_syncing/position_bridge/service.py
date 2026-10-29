@@ -89,13 +89,15 @@ def _lands_before(sent: Optional[int], reported: Optional[int]) -> bool:
     return sent is not None and reported is not None and 0 <= sent - reported <= LANDING_CHARS
 
 
-def _kobo_landing(row: Optional[PositionBridgeState], kepub: EpubBook, source: str, span: str) -> bool:
-    """Whether the Kobo reports the page start around the span we just pushed to it."""
-    if row is None or not row.kobo_sent or row.kosync_received_at is None:
+def _kobo_landing(row: Optional[PositionBridgeState], kepub: EpubBook, source: str, span: str,
+                  sent: Optional[str] = None) -> bool:
+    """Whether the Kobo reports the page start around a span we pushed to it (default: the latest)."""
+    sent = sent if sent is not None else (row.kobo_sent if row else None)
+    if row is None or not sent or row.kosync_received_at is None:
         return False
     if row.kobo_received_at is not None and _utc(row.kobo_received_at) > _utc(row.kosync_received_at):
         return False  # the Kobo has really moved since the push
-    sent_source, _, sent_span = row.kobo_sent.partition('#')
+    sent_source, _, sent_span = sent.partition('#')
     if sent_source != source:
         return False
     stream = kepub.span_stream(source)
@@ -141,17 +143,22 @@ def on_kobo_state(session, user_id: int, book_id: int, bookmark: dict, now: date
     translated = kobo_to_xpointer(epub, kepub, source, location["Value"])
     row = _state(session, user_id, book_id)
     landing = _kobo_landing(row, kepub, source, location["Value"])
-    decision = decide_kobo(row, key, read_at, translated, landing)
+    # Nickel stamps a report when it sends it, so it can report landing on a push
+    # only after the phone has moved again; that is a landing on the earlier push.
+    late_landing = not landing and \
+        _kobo_landing(row, kepub, source, location["Value"], sent=row.kobo_prev_sent or "")
+    decision = decide_kobo(row, key, read_at, translated, landing or late_landing)
     if decision.reason not in ("not-moved", "landing"):
         row.kobo_received = key
     if decision.forward or decision.reason == "older-than-other-move":
         row.kobo_received_at = read_at  # only real readings date a move
     if decision.forward:
+        row.kobo_prev_sent = None
         percentage = float(bookmark.get("ProgressPercent") or 0)
         _write_kosync(session, user_id, book_id, translated, percentage, now)
         row.kosync_sent = translated
         row.kosync_sent_percent = percentage
-    elif _push_pending(row, decision, key):
+    elif _push_pending(row, decision, key) or (late_landing and decision.reason == "landing"):
         # HandleStateRequest just stored this report over a push the Kobo hasn't
         # received; put the push back so the Kobo's next sync still gets it.
         pushed = _sent_location(kepub, row.kobo_sent)
@@ -249,8 +256,12 @@ def on_kosync_progress(session, user_id: int, book_id: int, xpointer: str, perce
     if decision.reason not in ("not-moved", "landing"):
         row.kosync_received = xpointer
     if decision.forward:
+        # Keep the push this one replaces while the Kobo may still land on it.
+        kobo_still_there = row.kobo_sent and row.kosync_received_at is not None and (
+            row.kobo_received_at is None
+            or _utc(row.kobo_received_at) <= _utc(row.kosync_received_at))
+        row.kobo_prev_sent = row.kobo_sent if kobo_still_there else None
         row.kosync_received_at = now  # only real readings date a move
-    if decision.forward:
         _push_to_kobo(session, user_id, book_id, location, percentage)
         row.kobo_sent = location.key()
         row.kobo_sent_percent = percentage
