@@ -29,8 +29,37 @@ def _fake_cwa_db(monkeypatch, settings=None, error=None):
     monkeypatch.setitem(sys.modules, "cwa_db", module)
 
 
+def _cwa_db_file(path, **columns):
+    con = sqlite3.connect(path / "cwa.db")
+    names = ", ".join(f"{name} INTEGER" for name in columns)
+    con.execute(f"CREATE TABLE cwa_settings ({names})")
+    con.execute(f"INSERT INTO cwa_settings VALUES ({', '.join('?' for _ in columns)})",
+                list(columns.values()))
+    con.commit()
+    con.close()
+
+
 @pytest.mark.unit
 class TestIsPositionBridgeEnabled:
+    @pytest.fixture(autouse=True)
+    def no_cwa_db_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CWA_DB_PATH", str(tmp_path))
+
+    def test_reads_cwa_db_without_building_cwa_db(self, tmp_path, monkeypatch):
+        _cwa_db_file(tmp_path, koreader_sync_enabled=1, kobo_kosync_position_bridge=1)
+        _fake_cwa_db(monkeypatch, error=RuntimeError("CWA_DB() must not be built"))
+        assert is_position_bridge_enabled() is True
+
+    def test_direct_read_requires_both_flags(self, tmp_path, monkeypatch):
+        _cwa_db_file(tmp_path, koreader_sync_enabled=1, kobo_kosync_position_bridge=0)
+        _fake_cwa_db(monkeypatch, {"koreader_sync_enabled": 1, "kobo_kosync_position_bridge": 1})
+        assert is_position_bridge_enabled() is False
+
+    def test_cwa_db_before_the_column_exists_falls_back(self, tmp_path, monkeypatch):
+        _cwa_db_file(tmp_path, koreader_sync_enabled=1)
+        _fake_cwa_db(monkeypatch, {"koreader_sync_enabled": 1, "kobo_kosync_position_bridge": 1})
+        assert is_position_bridge_enabled() is True
+
     def test_bridge_requires_koreader_sync(self, monkeypatch):
         _fake_cwa_db(monkeypatch, {"koreader_sync_enabled": 0, "kobo_kosync_position_bridge": 1})
         assert is_position_bridge_enabled() is False

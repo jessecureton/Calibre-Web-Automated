@@ -15,16 +15,17 @@ import sys
 sys.path.insert(1, '/app/calibre-web-automated/scripts/')
 
 
-def _read_setting_directly():
-    """Read the flag with one query. CWA_DB() reconciles the whole cwa.db schema
-    each time it is created, which is too heavy for every download/sync request."""
+def _read_setting_directly(columns=("koreader_sync_enabled",)):
+    """Read the flags with one query; True only if all are set. CWA_DB() reconciles the
+    whole cwa.db schema each time it is created, which is too heavy for every
+    download/sync request."""
     db_file = os.path.join(os.environ.get("CWA_DB_PATH", "/config"), "cwa.db")
     con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=5)
     try:
-        row = con.execute("SELECT koreader_sync_enabled FROM cwa_settings LIMIT 1").fetchone()
+        row = con.execute(f"SELECT {', '.join(columns)} FROM cwa_settings LIMIT 1").fetchone()
     finally:
         con.close()
-    return bool(row[0]) if row else False
+    return bool(row) and all(row)
 
 
 def is_koreader_sync_enabled() -> bool:
@@ -47,6 +48,10 @@ def is_position_bridge_enabled() -> bool:
 
     The bridge does nothing unless KOReader sync itself is enabled.
     """
+    try:
+        return _read_setting_directly(("koreader_sync_enabled", "kobo_kosync_position_bridge"))
+    except sqlite3.Error:
+        pass  # missing file/column (e.g. before CWA_DB adds the setting): use the full path below
     try:
         from cwa_db import CWA_DB
         settings = CWA_DB().cwa_settings
