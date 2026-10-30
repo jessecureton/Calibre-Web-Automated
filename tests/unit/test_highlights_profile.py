@@ -293,11 +293,25 @@ class TestAdminSection:
         other = session.query(Highlight).filter_by(user_id=OTHER_USER).one()
         assert other.readest_held and other.deleted_at is None
 
+    def test_restore_held_deletions_offers_that_users_holds_to_readest_again(self, world, session):
+        add_held(session, 2)
+        add_held(session, 1, user_id=OTHER_USER)
+        html = world.client.get(f"/admin/user/{USER}").get_data(as_text=True)
+        assert "Restore held highlights to Readest" in html
+        resp = world.client.post(f"/admin/user/{USER}/highlight-sync/restore-held")
+        assert resp.status_code == 302 and resp.headers["Location"].endswith(f"/admin/user/{USER}")
+        session.expire_all()
+        mine = session.query(Highlight).filter_by(user_id=USER).all()
+        assert len(mine) == 2 and all(not h.readest_held and h.readest_key is None and h.deleted_at is None
+                                      for h in mine)
+        other = session.query(Highlight).filter_by(user_id=OTHER_USER).one()
+        assert other.readest_held and other.readest_key == "key0"
+
     def test_both_actions_are_post_only(self, world):
-        for path in ("reset-device", "apply-held"):
+        for path in ("reset-device", "apply-held", "restore-held"):
             assert world.client.get(f"/admin/user/{USER}/highlight-sync/{path}").status_code == 405
 
-    @pytest.mark.parametrize("path", ["reset-device", "apply-held"])
+    @pytest.mark.parametrize("path", ["reset-device", "apply-held", "restore-held"])
     def test_admin_only(self, world, session, path):
         session.add(HighlightDevice(user_id=USER, readest_device_id="dev-abc-123"))
         add_held(session, 1)
@@ -307,11 +321,12 @@ class TestAdminSection:
         session.expire_all()
         assert session.query(HighlightDevice).one().readest_device_id == "dev-abc-123"
         held = session.query(Highlight).one()
-        assert held.readest_held and held.deleted_at is None
+        assert held.readest_held and held.deleted_at is None and held.readest_key == "key0"
 
     def test_unknown_user_is_not_found(self, world):
         assert world.client.post("/admin/user/99/highlight-sync/reset-device").status_code == 404
         assert world.client.post("/admin/user/99/highlight-sync/apply-held").status_code == 404
+        assert world.client.post("/admin/user/99/highlight-sync/restore-held").status_code == 404
 
 
 class TestKoboImportGate:
@@ -422,7 +437,7 @@ class TestEnterCannotTriggerAnAction:
         session.add(HighlightDevice(user_id=USER, readest_device_id="dev-abc-123"))
         add_held(session, 3)
         forms = forms_of(world.client.get(f"/admin/user/{USER}").get_data(as_text=True))
-        for path in ("reset-device", "apply-held"):
+        for path in ("reset-device", "apply-held", "restore-held"):
             form = next(f for f in forms if f["attrs"].get("action") == f"/admin/user/{USER}/highlight-sync/{path}")
             assert form is not main_form(forms) and form["attrs"]["method"].lower() == "post"
             assert any(i.get("name") == "csrf_token" and i.get("value") for i in form["inputs"])
@@ -436,6 +451,7 @@ class TestEnterCannotTriggerAnAction:
         forms = forms_of(world.client.get(f"/admin/user/{USER}").get_data(as_text=True))
         by_action = {f["attrs"].get("action", ""): f["attrs"] for f in forms}
         assert "3 highlights" in by_action[f"/admin/user/{USER}/highlight-sync/apply-held"]["data-confirm"]
+        assert "3 highlights" in by_action[f"/admin/user/{USER}/highlight-sync/restore-held"]["data-confirm"]
         reset = by_action[f"/admin/user/{USER}/highlight-sync/reset-device"]
         assert "Jo\"hn's" in reset["data-confirm"]  # parsed back from an escaped attribute
         assert reset["onsubmit"] == "return confirm(this.dataset.confirm);"  # no user text in the script

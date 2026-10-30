@@ -2007,6 +2007,27 @@ def highlight_apply_held_deletions(user_id):
     return redirect(url_for("admin.edit_user", user_id=user.id))
 
 
+@admi.route("/admin/user/<int:user_id>/highlight-sync/restore-held", methods=["POST"])
+@user_login_required
+@admin_required
+def highlight_restore_held(user_id):
+    """Undo the Readest deletions held back for the user: offer those highlights to Readest again."""
+    user = _highlight_user_or_404(user_id)
+    try:
+        restored = highlight_profile.restore_held_highlights(ub.session, user.id)
+        ub.session.commit()
+    except Exception:
+        ub.session.rollback()
+        log.exception("[highlight-sync] restoring held highlights failed")
+        flash(_("Could not restore the held highlights. See the log for details."), category="error")
+        return redirect(url_for("admin.edit_user", user_id=user.id))
+    log.info("[highlight-sync] user=%s: %s held highlights restored to Readest by admin %s",
+             user.id, restored, current_user.id)
+    flash(_("Restored the held highlights for %(name)s: %(count)s highlights go back to Readest on its next sync.",
+            name=user.name, count=restored), category="success")
+    return redirect(url_for("admin.edit_user", user_id=user.id))
+
+
 @admi.route("/admin/user/<int:user_id>/highlight-sync/no-kobo-import", methods=["POST"])
 @user_login_required
 @admin_required

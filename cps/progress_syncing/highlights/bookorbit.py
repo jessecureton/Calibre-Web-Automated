@@ -59,7 +59,8 @@ What CWA adds on top:
   keys Readest didn't list), so Readest's pass completes and doesn't repeat.
   The hold is sticky: held highlights are left out of later deletion counts
   until their keys reappear (which lifts the hold) or an admin releases them
-  with `release_held_deletions`, which applies the deletion.
+  with `release_held_deletions`, which applies the deletion, or restores them
+  with `restore_held_deletions`, which offers them to Readest again as adds.
 - Adds wait for Readest's changes: while a pass may still bring changes (a
   complete list naming keys CWA doesn't know beyond this request's changes, or
   a later chunk carrying changes), adds are withheld and `more` is true, so
@@ -466,6 +467,30 @@ def release_held_deletions(session, user_id: int, book_id: Optional[int] = None,
     session.flush()
     log.info(f"[highlight-sync] user={user_id} book={book_id}: released {deleted} held Readest deletion(s)")
     return deleted
+
+
+def restore_held_deletions(session, user_id: int, book_id: Optional[int] = None) -> int:
+    """
+    Undo the user's held Readest deletions (in one book, or all books): each held
+    highlight loses its Readest identity (key, seen and held flags, the version
+    Readest holds), so the next exchange offers it to Readest again as an add.
+    Nothing is deleted. Returns how many were restored. The caller commits.
+
+    An add lands on Readest's note id for that position, so a Readest that still
+    keeps the deleted note's tombstone keeps it deleted; CWA then logs it as acked
+    but not listed and leaves it undelivered, never deleting it.
+    """
+    query = session.query(Highlight).filter(Highlight.user_id == user_id, Highlight.readest_held.is_(True))
+    if book_id is not None:
+        query = query.filter(Highlight.book_id == book_id)
+    restored = 0
+    for row in query.all():
+        row.readest_key, row.readest_version, row.readest_failed_version = None, None, None
+        row.readest_seen = row.readest_held = False
+        restored += 1
+    session.flush()
+    log.info(f"[highlight-sync] user={user_id} book={book_id}: restored {restored} held highlight(s) to Readest")
+    return restored
 
 
 def _mint_datetime(session, row: Highlight, now: datetime) -> str:

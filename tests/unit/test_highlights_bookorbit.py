@@ -656,6 +656,30 @@ def test_release_held_deletions_applies_them(readest, session):
     assert bookorbit.release_held_deletions(session, USER) == 0
 
 
+def test_restore_held_deletions_offers_them_to_readest_again(readest, session):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 6)]
+    readest.run_pass()
+    for nid in ids:
+        readest.delete(nid)
+    readest.run_pass()
+    other = upsert_from_side(session, USER, OTHER_BOOK, "readest", "other-key",
+                             {"text": "another book", "xp0": xp(2, 0)}, datetime.now(timezone.utc))
+    other.readest_held, other.readest_seen = True, True
+    session.commit()
+    assert bookorbit.restore_held_deletions(session, USER, BOOK) == 4
+    session.commit()
+    restored = rows(session)
+    assert all(r.readest_key is None and not r.readest_held and not r.readest_seen and r.readest_version is None
+               and r.deleted_at is None for r in restored)
+    assert rows(session, OTHER_BOOK)[0].readest_held  # another book's hold is left alone
+    result = readest.run_pass()
+    assert sorted(a["text"] for a in result["toApply"]["add"]) == [f"passage {n}" for n in range(2, 6)]
+    assert len(live_notes(readest)) == 4
+    assert all(r.readest_key for r in rows(session))
+    assert bookorbit.restore_held_deletions(session, USER) == 1  # the other book's
+    assert bookorbit.restore_held_deletions(session, USER) == 0
+
+
 def test_held_highlight_is_not_offered_as_edit(readest, session):
     ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 6)]
     readest.run_pass()

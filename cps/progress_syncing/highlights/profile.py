@@ -91,3 +91,9 @@ def apply_held_deletions(session, user_id: int) -> int:
 def mark_no_kobo_highlights(session, user_id: int) -> None:
     """The admin says the user's Kobo holds no highlights to import: open the Kobo gate. The caller commits."""
     mark_kobo_import_done(session, user_id)
+
+
+def restore_held_highlights(session, user_id: int) -> int:
+    """Offer every highlight held for the user back to Readest; returns how many. The caller commits."""
+    from .bookorbit import restore_held_deletions  # bookorbit -> kosync -> kobo -> web -> profile
+    return restore_held_deletions(session, user_id)
