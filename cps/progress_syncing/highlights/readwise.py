@@ -14,7 +14,10 @@ creates.
 
 - create: one `POST /api/v2/highlights/` per book (chunks of 100). The ids Readwise
   made are read from `modified_highlights`, or, when that cannot be matched to our
-  highlights, from the book's export by `highlight_url`.
+  highlights, from the book's export by `highlight_url`
+  (`https://cwa.invalid/book/<uuid>/highlight/<id>`; the older `cwa://` form is
+  still recognised). If every item of a chunk is refused with the same 4xx, that is
+  taken as a configuration error: logged once, nothing quarantined, the run stops.
 - edit (a highlight with a `readwise_id`): `PATCH /api/v2/highlights/<id>/`.
 - delete: `DELETE /api/v2/highlights/<id>/`, and only for a highlight CWA created in
   Readwise, i.e. one with a recorded `readwise_id`.
@@ -187,6 +190,15 @@ def _locations(session, user_id, book_id) -> dict:
 # --- payloads -----------------------------------------------------------------
 
 def _highlight_url(info: BookInfo, row: Highlight) -> str:
+    """
+    Readwise wants a URL here. `.invalid` is reserved (RFC 2606), so the link is a
+    unique, stable id that never resolves and never names the CWA host.
+    """
+    return f"https://cwa.invalid/book/{info.uuid}/highlight/{row.id}"
+
+
+def _legacy_highlight_url(info: BookInfo, row: Highlight) -> str:
+    """The form the first builds sent; a copy created under it is still CWA's own."""
     return f"cwa://{info.uuid}/highlight/{row.id}"
 
 
@@ -471,6 +483,7 @@ def _post_creates(session, user, http, result, info, rows, locations, seen):
     """
     payloads = [_create_payload(info, row, locations.get(row.id, 0)) for row in rows]
     rows_by_url = {p["highlight_url"]: row.id for p, row in zip(payloads, rows)}
+    rows_by_url.update({_legacy_highlight_url(info, row): row.id for row in rows})
     row_ids = [row.id for row in rows]
     response = _request(http, user.readwise_token, "post",
                         f"{_api_base()}/api/v2/highlights/", json={"highlights": payloads})
@@ -543,16 +556,28 @@ def _push_creates(session, user, http, result, lookup):
             if len(chunk) == 1:
                 _quarantine(session, result, chunk[0].id, seen[chunk[0].id], refused)
                 continue
+            refusals = []  # (row id, response) of the items refused on their own
+            accepted = False
             for row in chunk:
                 row_seen = {row.id: seen[row.id]}
                 row_id = row.id
                 refused = _post_creates(session, user, http, result, info, [row], locations, row_seen)
                 if refused is None:
-                    continue
-                if _is_client_error(refused):
-                    _quarantine(session, result, row_id, seen[row_id], refused)
+                    accepted = True
+                elif _is_client_error(refused):
+                    refusals.append((row_id, refused))
                 else:
                     _failed(result, refused, row_id)
+            statuses = {response.status_code for _, response in refusals}
+            if not accepted and len(refusals) == len(chunk) and len(statuses) == 1:
+                # Every item refused alike: what is wrong is the request CWA builds (or
+                # the account), not the highlights. Keep them dirty for after the fix.
+                log.warning(f"Readwise refused every highlight of a create with {statuses.pop()}; "
+                            f"treating it as a configuration error, nothing quarantined, outbox stopped")
+                result.failed += len(chunk)
+                raise _Stop()
+            for row_id, response in refusals:
+                _quarantine(session, result, row_id, seen[row_id], response)
 
 
 def push_dirty(session, user, http=requests, book_info=None) -> PushResult:

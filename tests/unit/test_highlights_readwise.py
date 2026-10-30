@@ -40,6 +40,11 @@ def xp(frag, n, off=0):
     return P.format(frag=frag, n=n, off=off)
 
 
+def url_of(row_id, uuid=UUID):
+    """The highlight_url CWA sends: https on the reserved .invalid TLD, never the CWA host."""
+    return f"https://cwa.invalid/book/{uuid}/highlight/{row_id}"
+
+
 class FakeResponse:
     def __init__(self, status=200, body=None, headers=None):
         self.status_code = status
@@ -169,7 +174,7 @@ def test_new_highlight_posted_with_locator_and_id_stored(session, user, http):
         "source_type": "cwa", "category": "books", "note": "my note",
         "location_type": "order", "location": 1,
         "highlighted_at": "2026-10-01T12:00:00Z",
-        "highlight_url": f"cwa://{UUID}/highlight/{row.id}", "color": "yellow"}
+        "highlight_url": url_of(row.id), "color": "yellow"}
     session.refresh(row)
     assert row.readwise_id == "9001" and row.readwise_dirty is False
     assert (result.created, result.failed, result.rate_limited) == (1, 0, False)
@@ -454,7 +459,7 @@ def test_unresolved_id_stays_dirty_and_is_reposted_idempotently(session, user, h
     http.calls.clear()
     push_dirty(session, user, http, book_info=lookup)
     second = sorted(h["highlight_url"] for h in http.of("post")[0]["json"]["highlights"])
-    assert second == first == sorted(f"cwa://{UUID}/highlight/{r.id}" for r in (row, other))
+    assert second == first == sorted(url_of(r.id) for r in (row, other))
     for r in (row, other):
         session.refresh(r)
         assert r.readwise_dirty is False and r.readwise_id is not None
@@ -803,7 +808,7 @@ def test_export_lag_keeps_the_row_dirty_then_records_the_id(session, user, http)
     row = add(session, "k1", "lagging")
     http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [4242]}])
     http.routes[("get", "/api/v2/export/")] = lagging_export(
-        http, lambda: f"cwa://{UUID}/highlight/{row.id}", lag_runs=1)
+        http, lambda: url_of(row.id), lag_runs=1)
 
     push_dirty(session, user, http, book_info=lookup)
     session.refresh(row)
@@ -812,7 +817,7 @@ def test_export_lag_keeps_the_row_dirty_then_records_the_id(session, user, http)
 
     push_dirty(session, user, http, book_info=lookup)  # re-POSTs the same highlight_url, then finds it
     urls = [c["json"]["highlights"][0]["highlight_url"] for c in http.of("post")]
-    assert urls == [f"cwa://{UUID}/highlight/{row.id}"] * 2
+    assert urls == [url_of(row.id)] * 2
     session.refresh(row)
     assert row.readwise_id == "4242" and row.readwise_dirty is False
     assert row.readwise_resolve_attempts is None
@@ -823,7 +828,7 @@ def test_three_misses_are_taken_as_deduped(session, user, http, caplog):
     row = add(session, "k1", "lagging")
     http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [4242]}])
     http.routes[("get", "/api/v2/export/")] = lagging_export(
-        http, lambda: f"cwa://{UUID}/highlight/{row.id}", lag_runs=99)
+        http, lambda: url_of(row.id), lag_runs=99)
     attempts = []
     with caplog.at_level(logging.WARNING):
         for _ in range(readwise.MAX_RESOLVE_ATTEMPTS):
@@ -869,3 +874,49 @@ def test_delete_4xx_is_quarantined(session, user, http, caplog):
     http.calls.clear()
     push_dirty(session, user, http, book_info=lookup)
     assert http.calls == []
+
+
+def test_ownership_also_accepts_the_old_cwa_scheme_url(session, user, http):
+    """Rows created under the first url form are still recognised as CWA's own."""
+    mark_done(session)
+    row = add(session, "k1", "A passage")
+    http.routes[("get", "/api/v2/export/")] = lambda call: FakeResponse(200, {
+        "count": 1, "nextPageCursor": None, "results": [{"user_book_id": 555, "highlights": [
+            {"id": 4242, "text": "A passage", "url": f"cwa://{UUID}/highlight/{row.id}"}]}]})
+    result = push_dirty(session, user, http, book_info=lookup)
+    session.refresh(row)
+    assert row.readwise_id == "4242" and result.created == 1
+
+
+def test_a_chunk_refused_whole_with_one_status_is_a_configuration_error(session, user, http, caplog):
+    mark_done(session)
+    mark_done(session, OTHER_BOOK)
+    rows = [add(session, f"k{n}", f"text {n}", xp0=xp(2, n)) for n in range(3)]
+    later = add(session, "o1", "other book", book=OTHER_BOOK)
+    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(400, {"highlight_url": ["bad"]})
+    with caplog.at_level(logging.DEBUG):
+        result = push_dirty(session, user, http, book_info=lookup)
+    assert result.quarantined == 0 and result.created == 0
+    for row in [*rows, later]:
+        session.refresh(row)
+        assert row.readwise_dirty is True and row.readwise_error is None and row.readwise_id is None
+    # The whole chunk, then each item once; then the run stops (the other book isn't tried).
+    assert [len(c["json"]["highlights"]) for c in http.of("post")] == [3, 1, 1, 1]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "configuration" in r.getMessage()]
+    assert len(warnings) == 1 and "400" in warnings[0].getMessage()
+    assert "text 1" not in caplog.text
+
+
+def test_items_refused_with_different_statuses_are_quarantined(session, user, http):
+    mark_done(session)
+    rows = [add(session, f"k{n}", f"text {n}", xp0=xp(2, n)) for n in range(2)]
+
+    def post(call):
+        texts = [h["text"] for h in call["json"]["highlights"]]
+        return FakeResponse(422 if texts == ["text 1"] else 400, None)
+    http.routes[("post", "/api/v2/highlights/")] = post
+    result = push_dirty(session, user, http, book_info=lookup)
+    assert result.quarantined == 2
+    for row in rows:
+        session.refresh(row)
+    assert [r.readwise_error for r in rows] == ["http 400", "http 422"]
