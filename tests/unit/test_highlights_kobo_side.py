@@ -313,6 +313,39 @@ class TestApplyKoboPatch:
         assert [e["id"] for e in body["annotations"]] == [KOBO_ID]
         assert body["annotations"][0]["location"]["span"]["startChar"] == 4
 
+    def test_kobo_note_edit_on_a_readest_highlight_keeps_its_range_and_xpointers(self, session, books, files):
+        # Served to the Kobo with a range CWA computed; the Kobo reports a slightly
+        # different chapterProgress with its note edit. That is not a move.
+        row = readest_highlight(session, ("readest-xp0", "readest-xp1"))
+        row.kobo_id, row.kobo_chapter, row.kobo_start_path, row.kobo_start_char = KOBO_ID, CH2_PATH, r"span#kobo\.4\.1", 4
+        row.kobo_end_path, row.kobo_end_char, row.kobo_chapter_progress = r"span#kobo\.4\.1", 30, 0.8
+        session.commit()
+        body = {"updatedAnnotations": [annotation(note="from the Kobo", progress=0.8123,
+                                                  modified="2026-10-30T12:30:00Z")]}
+        apply_kobo_patch(session, USER, BOOK, body, NOW, files=files)
+        row = session.query(Highlight).one()
+        assert row.note == "from the Kobo"
+        assert (row.xp0, row.xp1) == ("readest-xp0", "readest-xp1")
+        assert (row.kobo_start_path, row.kobo_start_char, row.kobo_end_char) == (r"span#kobo\.4\.1", 4, 30)
+
+    def test_stale_kepub_does_not_null_the_xpointers(self, session, books, files):
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [annotation()]}, T0, files=files)
+        xps = ch2_xpointers(books)
+        assert (session.query(Highlight).one().xp0, session.query(Highlight).one().xp1) == xps
+        session.add(PositionBridgeState(user_id=USER, book_id=BOOK, kobo_copy_digest="another-copy"))
+        session.commit()
+        body = {"updatedAnnotations": [annotation(start_char=5, modified="2026-10-30T12:30:00Z")]}
+        apply_kobo_patch(session, USER, BOOK, body, NOW, files=files)
+        row = session.query(Highlight).one()
+        assert row.kobo_start_char == 5          # the device's range is recorded
+        assert (row.xp0, row.xp1) == xps         # but the XPointers aren't wiped
+
+    def test_missing_files_do_not_null_the_xpointers(self, session, books, files):
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [annotation()]}, T0, files=files)
+        body = {"updatedAnnotations": [annotation(start_char=5, modified="2026-10-30T12:30:00Z")]}
+        apply_kobo_patch(session, USER, BOOK, body, NOW, files=lambda book_id: (None, None))
+        assert (session.query(Highlight).one().xp0, session.query(Highlight).one().xp1) == ch2_xpointers(books)
+
     @pytest.mark.parametrize("body", [
         [annotation()],
         "text",

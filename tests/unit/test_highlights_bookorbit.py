@@ -700,16 +700,6 @@ def test_readest_position_move_clears_kobo_range_keeps_id(readest, session):
         user_id=USER, book_id=BOOK).one().kobo_etag_version == etag + 1
 
 
-def test_readest_end_move_clears_kobo_range(readest, session):
-    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "From the Kobo")
-    readest.run_pass()
-    [nid] = readest.notes
-    readest.edit(nid, xpointer1=xp(3, 30))
-    readest.run_pass()
-    [row] = rows(session)
-    assert row.xp1 == xp(3, 30) and row.kobo_start_path is None and row.kobo_id == "kobo-1"
-
-
 def _change(dt, pos0, pos1, text):
     return {"datetime": dt, "drawer": "lighten", "posFormat": "xpointer", "pos0": pos0,
             "pos1": pos1, "text": text}
@@ -956,3 +946,33 @@ def test_move_of_a_merged_highlight_keeps_its_kobo_id(readest, session):
     live = [r for r in rows(session) if r.deleted_at is None]
     assert len(rows(session)) == 1 and len(live) == 1
     assert live[0].kobo_id == "kobo-1" and live[0].xp0 == xp(3, 6) and live[0].kobo_start_path is None
+
+
+def test_readest_edit_of_a_merged_highlight_keeps_the_kobo_range(readest, session):
+    # Merged: the row keeps the XPointers CWA computed from the Kobo's range, while
+    # Readest's key comes from its own pos0. A key match proves no move.
+    nid = readest.highlight(xp(3, 1), xp(3, 20), "Merged passage")
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "Merged passage",
+                   at=datetime.now(timezone.utc))
+    readest.run_pass()
+    [row] = rows(session)
+    assert row.xp0 == xp(3, 0) and row.kobo_start_path is not None
+    readest.clock = int(time.time() * 1000) + 3600 * 1000      # Readest's later edit wins
+    readest.edit(nid, note="a later thought")
+    readest.run_pass()
+    [row] = rows(session)
+    assert row.note == "a later thought"
+    assert (row.xp0, row.xp1) == (xp(3, 0), xp(3, 20))
+    assert (row.kobo_start_path, row.kobo_start_char, row.kobo_end_char) == ("span#kobo\\.2\\.1", 0, 14)
+
+
+def test_readest_echo_with_another_pos1_on_a_key_match_keeps_the_kobo_range(readest, session):
+    # pos1 isn't in the key, so a pos1 that differs from CWA's xp1 on a key match is
+    # another spelling of the same end, not a move: the Kobo's range stays.
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "From the Kobo")
+    readest.run_pass()
+    [nid] = readest.notes
+    readest.edit(nid, xpointer1=xp(3, 30))
+    readest.run_pass()
+    [row] = rows(session)
+    assert row.xp1 == xp(3, 20) and row.kobo_start_path == "span#kobo\\.2\\.1" and row.kobo_id == "kobo-1"

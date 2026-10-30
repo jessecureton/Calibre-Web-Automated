@@ -299,8 +299,10 @@ def apply_kobo_patch(session, user_id: int, book_id: int, body: dict, now: datet
     Store a Kobo annotations PATCH for one book.
 
     Each `updatedAnnotations` entry is upserted by its Kobo id, with its location
-    kept verbatim and XPointers computed from it (None when untranslatable, or
-    when the Kobo holds a different KEPUB than the library's). An empty or
+    kept verbatim and XPointers computed from it when the range is new or moved
+    (None when untranslatable). When the book files can't be used (missing, or
+    the Kobo holds a different KEPUB than the library's) a create has none and an
+    edit keeps the ones it has. A change in chapterProgress alone is not a move. An empty or
     unreadable `clientLastModifiedUtc` is unknown: a create is dated `now`, and an
     edit to an existing highlight never wins.
 
@@ -338,12 +340,18 @@ def apply_kobo_patch(session, user_id: int, book_id: int, body: dict, now: datet
             books = _Books(session, user_id, book_id, epub_path, kepub_path)
         fields = _content_fields(entry, location, keep_location)
 
+        # chapterProgress is the Kobo's estimate, not part of the range: a change in
+        # it alone (as a note edit may report) is not a move.
         moved = not keep_location and (existing is None or existing.xp0 is None or
-                                       any(getattr(existing, name) != location[name] for name in _KOBO_FIELDS))
+                                       any(getattr(existing, name) != location[name]
+                                           for name in _KOBO_FIELDS[:5]))
         if moved:
             xps = _kobo_xpointers(books, location, kobo_id)
-            fields["xp0"], fields["xp1"] = xps if xps else (None, None)
-            untranslated += fields["xp0"] is None
+            if xps is not None:
+                fields["xp0"], fields["xp1"] = xps
+            # else: the book files can't be used (missing, or another KEPUB on the
+            # device). The XPointers can't be recomputed, so they are left as they are.
+            untranslated += xps is None or xps[0] is None
 
         if modified is None:
             anchor = existing or _find_merge_candidate(session, user_id, book_id, "kobo", fields)

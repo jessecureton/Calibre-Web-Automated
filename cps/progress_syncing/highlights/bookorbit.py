@@ -73,7 +73,11 @@ What CWA adds on top:
   Readest-known highlight whose key has dropped out of the complete list is
   that highlight moved in Readest. It keeps its row and its Kobo id, and its
   stored Kobo range is cleared, so the Kobo is served the moved highlight under
-  the same id.
+  the same id. A change found by its key is never a move (the key is
+  md5(datetime|pos0)): its XPointers are not taken, since Readest may spell
+  the passage differently from the ones CWA computed from the Kobo's range,
+  and the Kobo's range stays. So an end-only adjustment in Readest is not
+  carried to the other side.
 - A highlight Readest couldn't apply isn't offered again until it changes.
 - Progress (GET/PUT /syncs/progress) runs kosync's own handlers, authenticated
   with these headers, so the position bridge sees Readest's progress.
@@ -336,16 +340,24 @@ def _apply_change(session, user_id: int, book_id: int, ann, keys: set, complete:
                      f"from an add whose ack was lost")
             row.readest_key = key
             session.flush()
+    moved = False
     if row is None and complete:
         row = _moved_row(session, user_id, book_id, datetime_, keys)
         if row is not None:
             log.info(f"[highlight-sync] user={user_id} book={book_id}: highlight {row.id} moved in Readest")
             row.readest_key = key
+            moved = True
             session.flush()
-    if row is not None and (row.xp0, row.xp1) != (pos0, pos1):
+    if moved:
         # Moved in Readest: the Kobo's stored range is stale. Keep kobo_id, so the
         # Kobo is served the moved highlight under the same id.
         fields.update({name: None for name in KOBO_RANGE_FIELDS})
+    elif row is not None and row.xp0:
+        # Found by its key, md5(datetime|pos0): not moved. Readest's XPointers may
+        # spell the same passage differently from the ones CWA holds (computed from
+        # the Kobo's range, for a merged highlight), so they are not taken, and the
+        # Kobo's range stays.
+        del fields["xp0"], fields["xp1"]
     row = upsert_from_side(session, user_id, book_id, "readest", key, fields, now)
     row.readest_seen, row.readest_held = True, False
     if row.deleted_at is None and all(getattr(row, name) == value for name, value in fields.items()
