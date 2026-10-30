@@ -357,14 +357,6 @@
         </div>
         {% endif %}
       </div>
-
-      <div class="form-group">
-        <label>{{_('Readest password')}}</label>
-        <div>
-          <button type="submit" class="btn btn-default" id="generate_highlight_sync_password" formaction="{{ url_for('web.highlight_sync_password') }}" formmethod="post" formnovalidate>{{_('Generate highlight-sync password for Readest')}}</button>
-        </div>
-        <p class="cwa-settings-tip">{{_('Readest signs in with a password made just for highlight sync, so your CWA password stays private. Generating a new one replaces the old one, and it is shown only once. Enter it in Readest under Settings, Integrations, BookOrbit.')}}</p>
-      </div>
       {% endif %}
 
       {% if highlight_admin %}
@@ -372,13 +364,6 @@
         <p><strong>{{_('Readest device')}}:</strong> <span id="highlight-readest-device">{{ highlight_admin.readest_device_id or _('none') }}</span></p>
         <p><strong>{{_('Kobo firmware last seen')}}:</strong> <span id="highlight-kobo-firmware">{{ highlight_admin.kobo_firmware or _('none') }}</span></p>
         <p><strong>{{_('Held deletions')}}:</strong> <span id="highlight-held-count">{{ highlight_admin.held_count }}</span></p>
-        {% if highlight_admin.readest_device_id %}
-        <button type="submit" class="btn btn-default" id="highlight_reset_device" formaction="{{ url_for('admin.highlight_reset_readest_device', user_id=content.id) }}" formmethod="post" formnovalidate>{{_('Reset Readest device')}}</button>
-        {% endif %}
-        {% if highlight_admin.held_count %}
-        <button type="submit" class="btn btn-danger" id="highlight_apply_held" formaction="{{ url_for('admin.highlight_apply_held_deletions', user_id=content.id) }}" formmethod="post" formnovalidate onclick="return confirm('{{_('Delete the highlights Readest asked to delete?')}}');">{{_('Apply held deletions')}}</button>
-        {% endif %}
-        <p class="cwa-settings-tip">{{_('Reset the device when the user moves to a new phone or reinstalls Readest. Held deletions are Readest deletions paused because they looked like a mass deletion.')}}</p>
       </div>
       {% endif %}
     </div>
@@ -602,6 +587,42 @@
       {% endif %}
     </div>
   </form>
+
+  {% if (profile and highlight_sync_visible) or highlight_admin %}
+  <!-- Highlight Sync actions: their own forms, so Enter in the main form never triggers them -->
+  <div class="settings-container" id="highlight-sync-actions" style="max-width: none; margin-inline: 0rem; margin-bottom: 4rem;">
+    <h4 class="settings-section-header">{{_('Highlight Sync Actions')}}</h4>
+    {% if profile %}
+    <form method="POST" id="highlight_sync_password_form" action="{{ url_for('web.highlight_sync_password') }}" class="form-group"
+          data-confirm="{% if content.highlight_sync_key_md5 %}{{_('Generate a new password? The password Readest uses now stops working.')}}{% endif %}"
+          onsubmit="return !this.dataset.confirm || confirm(this.dataset.confirm);">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>{{_('Readest password')}}</label>
+      <div><button type="submit" class="btn btn-default" id="generate_highlight_sync_password">{{_('Generate highlight-sync password for Readest')}}</button></div>
+      <p class="cwa-settings-tip">{{_('Readest signs in with a password made just for highlight sync, so your CWA password stays private. Generating a new one replaces the old one, and it is shown only once. Enter it in Readest under Settings, Integrations, BookOrbit.')}}</p>
+    </form>
+    {% endif %}
+    {% if highlight_admin %}
+    {% if highlight_admin.readest_device_id %}
+    <form method="POST" id="highlight_reset_device_form" action="{{ url_for('admin.highlight_reset_readest_device', user_id=content.id) }}" class="form-group"
+          data-confirm="{{_('Reset the Readest device for %(name)s? The next Readest to sync becomes the device.', name=content.name)}}"
+          onsubmit="return confirm(this.dataset.confirm);">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-default" id="highlight_reset_device">{{_('Reset Readest device')}}</button>
+    </form>
+    {% endif %}
+    {% if highlight_admin.held_count %}
+    <form method="POST" id="highlight_apply_held_form" action="{{ url_for('admin.highlight_apply_held_deletions', user_id=content.id) }}" class="form-group"
+          data-confirm="{{_('Delete the %(count)s highlights Readest asked to delete?', count=highlight_admin.held_count)}}"
+          onsubmit="return confirm(this.dataset.confirm);">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-danger" id="highlight_apply_held">{{_('Apply held deletions')}}</button>
+    </form>
+    {% endif %}
+    <p class="cwa-settings-tip">{{_('Reset the device when the user moves to a new phone or reinstalls Readest. Held deletions are Readest deletions paused because they looked like a mass deletion.')}}</p>
+    {% endif %}
+  </div>
+  {% endif %}
 </div>
 
 <div class="modal fade" id="modal_kobo_token" tabindex="-1" role="dialog" aria-labelledby="kobo_tokenModalLabel">

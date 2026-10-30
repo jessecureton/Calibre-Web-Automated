@@ -10,6 +10,7 @@ import hashlib
 import os
 import re
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from types import SimpleNamespace
 
 import pytest
@@ -311,3 +312,96 @@ class TestAdminSection:
     def test_unknown_user_is_not_found(self, world):
         assert world.client.post("/admin/user/99/highlight-sync/reset-device").status_code == 404
         assert world.client.post("/admin/user/99/highlight-sync/apply-held").status_code == 404
+
+
+class Forms(HTMLParser):
+    """The page's forms: attributes, and the inputs and buttons inside each (nesting is tracked)."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack, self.forms = [], []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            form = {"attrs": attrs, "inputs": [], "buttons": []}
+            self.forms.append(form)
+            self.stack.append(form)
+        elif self.stack and tag == "input":
+            self.stack[-1]["inputs"].append(attrs)
+        elif self.stack and tag == "button":
+            self.stack[-1]["buttons"].append(attrs)
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self.stack:
+            self.stack.pop()
+
+
+def forms_of(html):
+    parser = Forms()
+    parser.feed(html)
+    return parser.forms
+
+
+def main_form(forms):
+    return next(f for f in forms if f["attrs"].get("role") == "form")
+
+
+def submits(form):
+    """Buttons that submit the form: a <button> with no type is a submit button too."""
+    return [b for b in form["buttons"] if b.get("type", "submit") == "submit"]
+
+
+class TestEnterCannotTriggerAnAction:
+    """Enter in a text field presses the form's first submit button, so the main form must have none."""
+
+    def test_profile_main_form_has_no_submit_button(self, world):
+        main = main_form(forms_of(world.client.get("/me").get_data(as_text=True)))
+        assert submits(main) == []
+        assert not any("formaction" in b for b in main["buttons"])
+
+    def test_admin_main_form_has_no_submit_button(self, world, session):
+        session.add(HighlightDevice(user_id=USER, readest_device_id="dev-abc-123"))
+        add_held(session, 1)
+        main = main_form(forms_of(world.client.get(f"/admin/user/{USER}").get_data(as_text=True)))
+        assert submits(main) == []
+        assert not any("formaction" in b for b in main["buttons"])
+
+    def test_profile_action_form_is_its_own_form_with_csrf(self, world):
+        forms = forms_of(world.client.get("/me").get_data(as_text=True))
+        form = next(f for f in forms if f["attrs"].get("action") == "/me/highlight-sync-password")
+        assert form is not main_form(forms) and form["attrs"]["method"].lower() == "post"
+        assert any(i.get("name") == "csrf_token" and i.get("value") for i in form["inputs"])
+        assert len(submits(form)) == 1 and "formaction" not in form["buttons"][0]
+
+    def test_admin_action_forms_are_their_own_forms_with_csrf(self, world, session):
+        session.add(HighlightDevice(user_id=USER, readest_device_id="dev-abc-123"))
+        add_held(session, 3)
+        forms = forms_of(world.client.get(f"/admin/user/{USER}").get_data(as_text=True))
+        for path in ("reset-device", "apply-held"):
+            form = next(f for f in forms if f["attrs"].get("action") == f"/admin/user/{USER}/highlight-sync/{path}")
+            assert form is not main_form(forms) and form["attrs"]["method"].lower() == "post"
+            assert any(i.get("name") == "csrf_token" and i.get("value") for i in form["inputs"])
+            assert len(submits(form)) == 1 and "formaction" not in form["buttons"][0]
+            assert form["attrs"]["data-confirm"]  # asked before it runs
+
+    def test_confirms_name_the_held_count_and_survive_quotes_in_a_name(self, world, session):
+        session.get(ub.User, USER).name = "Jo\"hn's"
+        session.add(HighlightDevice(user_id=USER, readest_device_id="dev-abc-123"))
+        add_held(session, 3)
+        forms = forms_of(world.client.get(f"/admin/user/{USER}").get_data(as_text=True))
+        by_action = {f["attrs"].get("action", ""): f["attrs"] for f in forms}
+        assert "3 highlights" in by_action[f"/admin/user/{USER}/highlight-sync/apply-held"]["data-confirm"]
+        reset = by_action[f"/admin/user/{USER}/highlight-sync/reset-device"]
+        assert "Jo\"hn's" in reset["data-confirm"]  # parsed back from an escaped attribute
+        assert reset["onsubmit"] == "return confirm(this.dataset.confirm);"  # no user text in the script
+
+    def test_enter_in_the_main_form_goes_to_the_normal_save(self, world, session):
+        """What Enter submits is the main form's own fields, posted to its own (empty) action: the profile save."""
+        main = main_form(forms_of(world.client.get("/me").get_data(as_text=True)))
+        assert "action" not in main["attrs"] and main["attrs"]["method"].lower() == "post"
+        names = {i.get("name") for i in main["inputs"]}
+        assert {"csrf_token", "email", "readwise_token"} <= names
+        post_profile(world, readwise_token=TOKEN)  # the same fields, posted to /me
+        assert user(session).readwise_token == TOKEN
+        assert user(session).highlight_sync_key_md5 is None  # no password was generated
