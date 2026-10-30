@@ -434,7 +434,8 @@ def test_post_deduped_by_readwise_keeps_no_id(session, user, http):
     http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": []}])
     http.routes[("get", "/api/v2/export/")] = FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
         {"user_book_id": 555, "highlights": [{"id": 3, "text": "known passage", "url": None}]}]})
-    push_dirty(session, user, http, book_info=lookup)
+    for _ in range(readwise.MAX_RESOLVE_ATTEMPTS):
+        push_dirty(session, user, http, book_info=lookup)
     session.refresh(row)
     assert row.readwise_id is None and row.readwise_dirty is False
 
@@ -616,7 +617,8 @@ def test_single_create_deduped_against_other_highlight_records_no_id(session, us
     http.routes[("get", "/api/v2/export/")] = FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
         {"user_book_id": 555, "highlights": [{"id": 3, "text": "Known passage", "url": "https://elsewhere/x"}]}]})
     with caplog.at_level(logging.WARNING):
-        push_dirty(session, user, http, book_info=lookup)
+        for _ in range(readwise.MAX_RESOLVE_ATTEMPTS):
+            push_dirty(session, user, http, book_info=lookup)
     session.refresh(row)
     assert row.readwise_id is None and row.readwise_dirty is False
     assert f"Highlight {row.id} was deduped against an existing Readwise highlight" in caplog.text
@@ -639,7 +641,8 @@ def test_batch_dedupe_by_text_records_no_id_and_never_patches(session, user, htt
         {"user_book_id": 555, "highlights": [
             {"id": 4, "text": "fresh one", "url": f"cwa://{UUID}/highlight/{mine.id}"},
             {"id": 3, "text": "known passage", "url": None}]}]})
-    push_dirty(session, user, http, book_info=lookup)
+    for _ in range(readwise.MAX_RESOLVE_ATTEMPTS):
+        push_dirty(session, user, http, book_info=lookup)
     session.refresh(mine)
     session.refresh(dup)
     assert mine.readwise_id == "4" and dup.readwise_id is None
@@ -780,3 +783,89 @@ def test_task_respects_the_setting(monkeypatch):
     monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: False)
     module.TaskReadwiseHighlights().run(None)
     assert pushed == []
+
+
+def lagging_export(http, session_row_url_for, lag_runs):
+    """An export that omits our highlight for the first `lag_runs` reads, then lists it."""
+    state = {"reads": 0}
+
+    def export(call):
+        state["reads"] += 1
+        items = [] if state["reads"] <= lag_runs else [
+            {"id": 4242, "text": "lagging", "url": session_row_url_for()}]
+        return FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
+            {"user_book_id": 555, "highlights": items}]})
+    return export
+
+
+def test_export_lag_keeps_the_row_dirty_then_records_the_id(session, user, http):
+    mark_done(session)
+    row = add(session, "k1", "lagging")
+    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [4242]}])
+    http.routes[("get", "/api/v2/export/")] = lagging_export(
+        http, lambda: f"cwa://{UUID}/highlight/{row.id}", lag_runs=1)
+
+    push_dirty(session, user, http, book_info=lookup)
+    session.refresh(row)
+    assert row.readwise_dirty is True and row.readwise_id is None
+    assert row.readwise_resolve_attempts == 1
+
+    push_dirty(session, user, http, book_info=lookup)  # re-POSTs the same highlight_url, then finds it
+    urls = [c["json"]["highlights"][0]["highlight_url"] for c in http.of("post")]
+    assert urls == [f"cwa://{UUID}/highlight/{row.id}"] * 2
+    session.refresh(row)
+    assert row.readwise_id == "4242" and row.readwise_dirty is False
+    assert row.readwise_resolve_attempts is None
+
+
+def test_three_misses_are_taken_as_deduped(session, user, http, caplog):
+    mark_done(session)
+    row = add(session, "k1", "lagging")
+    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [4242]}])
+    http.routes[("get", "/api/v2/export/")] = lagging_export(
+        http, lambda: f"cwa://{UUID}/highlight/{row.id}", lag_runs=99)
+    attempts = []
+    with caplog.at_level(logging.WARNING):
+        for _ in range(readwise.MAX_RESOLVE_ATTEMPTS):
+            push_dirty(session, user, http, book_info=lookup)
+            session.refresh(row)
+            attempts.append((row.readwise_dirty, row.readwise_resolve_attempts))
+    assert attempts == [(True, 1), (True, 2), (False, None)]
+    assert row.readwise_id is None
+    assert f"Highlight {row.id} was deduped against an existing Readwise highlight" in caplog.text
+    assert len(http.of("post")) == 3 and "lagging" not in caplog.text
+
+
+def test_a_change_resets_the_resolve_count(session, user, http):
+    mark_done(session)
+    row = add(session, "k1", "lagging")
+    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [4242]}])
+    http.routes[("get", "/api/v2/export/")] = lagging_export(http, lambda: "none", lag_runs=99)
+    push_dirty(session, user, http, book_info=lookup)
+    push_dirty(session, user, http, book_info=lookup)
+    session.refresh(row)
+    assert row.readwise_resolve_attempts == 2
+    upsert_from_side(session, USER, BOOK, "kobo", "k1", {"text": "lagging, edited", "updated_at": T0 + timedelta(hours=1)},
+                     T0 + timedelta(hours=1))
+    session.commit()
+    session.refresh(row)
+    assert row.readwise_resolve_attempts is None and row.readwise_dirty is True
+
+
+def test_delete_4xx_is_quarantined(session, user, http, caplog):
+    mark_done(session)
+    row = add(session, "k1", "x")
+    row.readwise_id = "7001"
+    session.commit()
+    delete_from_side(session, USER, BOOK, "kobo", "k1", T0 + timedelta(hours=1))
+    session.commit()
+    http.routes[("delete", "/api/v2/highlights/7001/")] = FakeResponse(400, None)
+    with caplog.at_level(logging.WARNING):
+        result = push_dirty(session, user, http, book_info=lookup)
+    assert result.quarantined == 1 and len(http.of("delete")) == 1
+    session.refresh(row)
+    assert row.readwise_error == "http 400" and row.readwise_dirty is False
+    assert f"highlight {row.id} with 400" in caplog.text
+    http.calls.clear()
+    push_dirty(session, user, http, book_info=lookup)
+    assert http.calls == []

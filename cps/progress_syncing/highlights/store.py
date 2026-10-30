@@ -67,6 +67,8 @@ class Highlight(AppBase):
         readwise_error: short reason (e.g. "http 400") Readwise refused this version of the
             highlight; it is then not dirty and is left alone until its next change, which
             clears the error
+        readwise_resolve_attempts: how many outbox runs created the highlight in Readwise
+            but could not find it in the export; reset by a match or by a change
     """
     __tablename__ = 'highlight'
     __table_args__ = (
@@ -105,6 +107,7 @@ class Highlight(AppBase):
     readwise_id = Column(String)
     readwise_dirty = Column(Boolean, nullable=False, default=False, server_default='0')
     readwise_error = Column(String)
+    readwise_resolve_attempts = Column(Integer)
 
     def __repr__(self):
         return f'<Highlight user={self.user_id} book={self.book_id} id={self.id}>'
@@ -182,6 +185,7 @@ _HIGHLIGHT_COLUMNS = (
     "readest_seen BOOLEAN NOT NULL DEFAULT 0", "readest_held BOOLEAN NOT NULL DEFAULT 0",
     "version INTEGER NOT NULL DEFAULT 1",
     "readwise_id TEXT", "readwise_dirty BOOLEAN NOT NULL DEFAULT 0", "readwise_error TEXT",
+    "readwise_resolve_attempts INTEGER",
 )
 _BOOK_STATE_COLUMNS = (
     "kobo_etag_version INTEGER NOT NULL DEFAULT 0",
@@ -298,6 +302,7 @@ def _changed(session, row: Highlight) -> None:
     row.version = (row.version or 1) + 1
     row.readwise_dirty = True
     row.readwise_error = None
+    row.readwise_resolve_attempts = None
     _bump_book(session, row.user_id, row.book_id)
 
 

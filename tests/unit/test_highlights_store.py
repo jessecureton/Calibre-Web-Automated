@@ -53,6 +53,7 @@ EXPECTED = {
         "kobo_end_path", "kobo_end_char", "kobo_chapter_progress",
         "xp0", "xp1", "readest_key", "readest_datetime",
         "readest_version", "readest_failed_version", "readest_seen", "readest_held", "version", "readwise_id", "readwise_dirty", "readwise_error",
+        "readwise_resolve_attempts",
     },
     "highlight_book_state": {
         "id", "user_id", "book_id", "kobo_etag_version", "kobo_delivered_version",

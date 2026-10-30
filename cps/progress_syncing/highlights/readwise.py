@@ -40,6 +40,8 @@ from typing import NamedTuple, Optional
 
 import requests
 
+from sqlalchemy import func
+
 from ... import logger
 from .store import Highlight, HighlightBookState, _normalize, _utc
 
@@ -50,6 +52,9 @@ DEFAULT_RETRY_AFTER = 60
 REQUEST_TIMEOUT = 30
 CREATE_CHUNK = 100
 MAX_PAGES = 50
+# Runs that may find a fresh create missing from Readwise's export (it can lag the POST)
+# before the highlight is taken to have been deduped against an existing one.
+MAX_RESOLVE_ATTEMPTS = 3
 
 # Readwise field limits (https://readwise.io/api_deets)
 MAX_TEXT, MAX_NOTE, MAX_TITLE, MAX_AUTHOR = 8191, 8191, 511, 1024
@@ -368,7 +373,19 @@ def _settle(session, row_id, seen_version, **values) -> bool:
 
 def _record_id(session, row_id, readwise_id):
     session.query(Highlight).filter(Highlight.id == row_id).update(
-        {"readwise_id": readwise_id}, synchronize_session=False)
+        {"readwise_id": readwise_id, "readwise_resolve_attempts": None}, synchronize_session=False)
+
+
+def _count_miss(session, row_id, seen_version) -> Optional[int]:
+    """Count one run that could not find the created highlight in the export. Returns the
+    count, or None if the highlight changed meanwhile (a change resets the count)."""
+    counted = session.query(Highlight).filter(
+        Highlight.id == row_id, Highlight.version == seen_version).update(
+        {"readwise_resolve_attempts": func.coalesce(Highlight.readwise_resolve_attempts, 0) + 1},
+        synchronize_session=False)
+    if not counted:
+        return None
+    return session.query(Highlight.readwise_resolve_attempts).filter(Highlight.id == row_id).scalar()
 
 
 def _is_client_error(response) -> bool:
@@ -401,6 +418,8 @@ def _push_deletes(session, user, http, result):
             _settle(session, row_id, seen, readwise_dirty=False)
             session.commit()
             result.deleted += 1
+        elif _is_client_error(response):
+            _quarantine(session, result, row_id, seen, response)
         else:
             _failed(result, response, row_id)
 
@@ -468,11 +487,20 @@ def _post_creates(session, user, http, result, info, rows, locations, seen):
             _record_id(session, row_id, ids[row_id])
             _settle(session, row_id, seen[row_id], readwise_dirty=False)
             result.created += 1
-        else:
+            continue
+        # The export is readable but does not show our copy. It may lag the POST, so keep the
+        # row dirty: the next run re-POSTs (idempotent by highlight_url) and looks again. Only
+        # after repeated misses is the passage taken to have been deduped against an existing one.
+        attempts = _count_miss(session, row_id, seen[row_id])
+        if attempts is not None and attempts >= MAX_RESOLVE_ATTEMPTS:
             log.warning(f"Highlight {row_id} was deduped against an existing Readwise highlight; "
                         f"CWA keeps no copy there")
-            _settle(session, row_id, seen[row_id], readwise_dirty=False)
+            _settle(session, row_id, seen[row_id], readwise_dirty=False, readwise_resolve_attempts=None)
             result.backfill_skipped += 1
+        else:
+            log.info(f"Highlight {row_id} not in the Readwise export yet "
+                     f"(attempt {attempts or 0} of {MAX_RESOLVE_ATTEMPTS}); left for the next run")
+            result.failed += 1
     session.commit()
     return None
 
