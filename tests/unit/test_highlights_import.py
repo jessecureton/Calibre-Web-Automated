@@ -231,12 +231,13 @@ class TestPlanImport:
     def test_summary_names_books_and_counts_and_never_text(self, session, main_db, cwa):
         p = plan(session, read_kobo_highlights(main_db), cwa=cwa)
         summary = p.summary()
+        none = {"new": 0, "already_present": 0, "contained_in_existing": 0, "recovered": 0, "unmatched": 0}
         assert summary == [
-            {"title": "A Store Book", "new": 0, "already_present": 0, "recovered": 0, "unmatched": 1},
-            {"title": TITLE, "new": 1, "already_present": 0, "recovered": 0, "unmatched": 0},
+            {"title": "A Store Book", **none, "unmatched": 1, "reasons": {kobo_import.REASONS["no_book"]: 1}},
+            {"title": TITLE, **none, "new": 1, "reasons": {}},
         ]
         assert FIRST not in repr(summary)
-        assert p.counts() == {"new": 1, "already_present": 0, "recovered": 0, "unmatched": 1}
+        assert p.counts() == {**none, "new": 1, "unmatched": 1}
 
 
 class TestRecovery:
@@ -245,9 +246,10 @@ class TestRecovery:
                             titles=(("file:///mnt/onboard/old.epub", title, author),))
         return read_kobo_highlights(path)
 
-    def old_row(self, bookmark_id=OLD1, text=SECOND, progress=0.9):
+    def old_row(self, bookmark_id=OLD1, text=SECOND, progress=0.9,
+                content="file:///mnt/onboard/old.epub#(7)OEBPS/text/ch2.xhtml"):
         return bookmark(bookmark_id, volume="file:///mnt/onboard/old.epub",
-                        content="file:///mnt/onboard/old.epub#(7)OEBPS/text/ch2.xhtml",
+                        content=content,
                         start="OEBPS/text/ch2.xhtml#point(/1/4/5/1/3:5)", end="OEBPS/text/ch2.xhtml#point(/1/4/5/1/3:9)",
                         text=text, progress=progress)
 
@@ -320,6 +322,72 @@ class TestRecovery:
         cwa = dict(cwa, files=lambda book_id: (None, None))
         older = self.older(tmp_path, [self.old_row()])
         assert len(plan(session, read_kobo_highlights(main_db), older, cwa=cwa).recovered) == 0
+
+    def repeated_cwa(self, cwa, tmp_path):
+        """A library whose book repeats "Then more." twice in chapter 2, and once in chapter 1."""
+        ch2 = CH2.replace("</body>", "<p>Then more.</p><p>Then more.</p></body>")
+        epub = write_book(tmp_path / "r.epub", {"ch1.xhtml": CH1, "ch2.xhtml": ch2})
+        kepub = write_book(tmp_path / "r.kepub", {"ch1.xhtml": kepubify_like(CH1), "ch2.xhtml": kepubify_like(ch2)})
+        return dict(cwa, files=lambda book_id: (epub, kepub))
+
+    def test_a_passage_repeated_in_the_book_is_ambiguous_not_placed(self, session, main_db, tmp_path, cwa):
+        cwa = self.repeated_cwa(cwa, tmp_path)
+        # the older chapter's file is known (ch2) and holds two copies
+        older = self.older(tmp_path, [self.old_row(text="Then more.")])
+        p = plan(session, read_kobo_highlights(main_db), older, cwa=cwa)
+        assert p.recovered == []
+        (item,) = [i for i in p.unmatched if i.row["bookmark_id"] == OLD1]
+        assert item.reason == kobo_import.REASONS["ambiguous_text"]
+        assert apply_import(session, USER, p, NOW) == 1  # only the main row; nothing placed by guesswork
+
+    def test_unknown_chapter_searches_the_whole_book_and_a_repeat_is_ambiguous(self, session, main_db, tmp_path, cwa):
+        cwa = self.repeated_cwa(cwa, tmp_path)
+        older = self.older(tmp_path, [self.old_row(text="Then more.", content="file:///old.epub#(3)OEBPS/zzz/other.xhtml")])
+        p = plan(session, read_kobo_highlights(main_db), older, cwa=cwa)
+        assert p.recovered == []
+        assert [i.reason for i in p.unmatched if i.row["bookmark_id"] == OLD1] == [kobo_import.REASONS["ambiguous_text"]]
+
+    def test_a_unique_passage_still_recovers_in_a_book_with_repeats(self, session, main_db, tmp_path, cwa):
+        cwa = self.repeated_cwa(cwa, tmp_path)
+        older = self.older(tmp_path, [self.old_row(), self.old_row(OLD2, text="A scene break follows.",
+                                                                    content="file:///old.epub#(3)OEBPS/zzz/other.xhtml")])
+        p = plan(session, read_kobo_highlights(main_db), older, cwa=cwa)
+        assert sorted(i.row["bookmark_id"] for i in p.recovered) == [OLD1, OLD2]
+        assert {i.row["bookmark_id"]: i.fields["kobo_chapter"] for i in p.recovered} == {
+            OLD1: CH2_PATH, OLD2: "OEBPS/text/ch1.xhtml"}
+
+    def test_a_text_not_in_the_named_chapter_is_looked_for_in_the_whole_book(self, session, main_db, tmp_path, cwa):
+        older = self.older(tmp_path, [self.old_row(text="A scene break follows.")])  # names ch2; the text is in ch1
+        (item,) = plan(session, read_kobo_highlights(main_db), older, cwa=cwa).recovered
+        assert item.fields["kobo_chapter"] == "OEBPS/text/ch1.xhtml"
+
+    def test_the_named_chapter_decides_between_copies_in_different_chapters(self, session, main_db, tmp_path, cwa):
+        ch2 = CH2.replace("</body>", "<p>A scene break follows.</p></body>")  # also in ch1
+        epub = write_book(tmp_path / "d.epub", {"ch1.xhtml": CH1, "ch2.xhtml": ch2})
+        kepub = write_book(tmp_path / "d.kepub", {"ch1.xhtml": kepubify_like(CH1), "ch2.xhtml": kepubify_like(ch2)})
+        cwa = dict(cwa, files=lambda book_id: (epub, kepub))
+        older = self.older(tmp_path, [self.old_row(text="A scene break follows.")])
+        (item,) = plan(session, read_kobo_highlights(main_db), older, cwa=cwa).recovered
+        assert item.fields["kobo_chapter"] == CH2_PATH
+
+    def test_an_unmatched_main_row_does_not_suppress_the_older_copy(self, session, tmp_path, cwa):
+        # same text, but its location is not a KEPUB one, so nothing is imported for it
+        main = make_kobo_db(tmp_path / "main.sqlite", [bookmark(BM2, start="OEBPS/text/ch2.xhtml#point(/1/2:3)",
+                                                                text=SECOND)])
+        p = plan(session, read_kobo_highlights(main), self.older(tmp_path, [self.old_row()]), cwa=cwa)
+        assert [i.row["bookmark_id"] for i in p.unmatched] == [BM2]
+        assert [i.row["bookmark_id"] for i in p.recovered] == [OLD1]
+        assert p.already_present == [] and p.contained_in_existing == []
+
+    def test_text_inside_an_existing_highlight_has_its_own_bucket(self, session, main_db, tmp_path, cwa):
+        upsert_from_side(session, USER, BOOK, "readest", "rk", {
+            "text": "The wife had discovered that the husband was carrying on an intrigue."}, NOW)
+        session.commit()
+        p = plan(session, read_kobo_highlights(main_db), self.older(tmp_path, [self.old_row()]), cwa=cwa)
+        assert [i.row["bookmark_id"] for i in p.contained_in_existing] == [OLD1]
+        assert p.recovered == [] and p.counts()["contained_in_existing"] == 1
+        (entry,) = [b for b in p.summary() if b["title"] == TITLE]
+        assert entry["contained_in_existing"] == 1 and entry["already_present"] == 0
 
     def test_without_an_older_db_the_catalog_is_never_read(self, session, main_db, cwa):
         def fail():
@@ -512,6 +580,7 @@ class TestAdminRoute:
         html = resp.get_data(as_text=True)
         assert resp.status_code == 200
         assert TITLE in html and "A Store Book" in html
+        assert kobo_import.REASONS["no_book"] in html  # the reason an unmatched row was left out
         assert FIRST not in html and "Unmatched volume" not in html
         assert 'name="token"' in html and ">Import<" in html
         assert session.query(Highlight).count() == 0  # a dry run writes nothing
@@ -554,6 +623,25 @@ class TestAdminRoute:
         resp = upload(web, junk)
         assert resp.status_code == 200
         assert not os.path.isdir(kobo_import.STASH_ROOT) or os.listdir(kobo_import.STASH_ROOT) == []
+
+    def test_apply_for_a_user_deleted_since_the_upload_does_nothing(self, web, session):
+        upload(web, user_id=str(OTHER_USER))
+        with web.client.session_transaction() as s:
+            token = s["highlight_import_token"]
+        session.delete(session.query(ub.User).filter_by(id=OTHER_USER).one())
+        session.commit()
+        web.client.post("/admin/highlights/import/apply", data={"token": token})
+        assert session.query(Highlight).count() == 0
+        assert os.listdir(kobo_import.STASH_ROOT) == []
+
+    def test_older_copy_page_shows_the_contained_column(self, web):
+        path = make_kobo_db(web.path + ".old", [TestRecovery().old_row()],
+                            titles=(("file:///mnt/onboard/old.epub", TITLE, AUTHOR),))
+        data = {"kobo_db": (open(web.path, "rb"), "KoboReader.sqlite"),
+                "older_db": (open(path, "rb"), "old.sqlite"), "user_id": str(USER)}
+        html = web.client.post("/admin/highlights/import", data=data,
+                               content_type="multipart/form-data").get_data(as_text=True)
+        assert "Inside an existing one" in html and "Older copy: text inside a highlight CWA already has" in html
 
     def test_unknown_user_is_refused(self, web):
         resp = upload(web, user_id="999")

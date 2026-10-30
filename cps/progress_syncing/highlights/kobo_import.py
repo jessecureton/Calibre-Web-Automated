@@ -41,7 +41,7 @@ from typing import Callable, NamedTuple, Optional
 from ... import logger
 from ..position_bridge.service import library_files
 from .kobo_side import _KOBO_FIELDS, _Books, _has_range, _parse_kobo_time, fields_from_entry
-from .ranges import locate_text_range
+from .ranges import count_text_occurrences, locate_text_range
 from .store import Highlight, upsert_from_side
 
 log = logger.create()
@@ -60,7 +60,9 @@ REASONS = {
     "ambiguous_book": "more than one library book matches",
     "no_files": "book files unavailable",
     "no_text": "text not found in the book",
+    "ambiguous_text": "text occurs more than once in the book",
 }
+BUCKETS = ("new", "already_present", "contained_in_existing", "recovered", "unmatched")
 
 
 class KoboDatabaseError(ValueError):
@@ -87,20 +89,23 @@ class PlanItem:
 class ImportPlan:
     new: list = field(default_factory=list)
     already_present: list = field(default_factory=list)
+    contained_in_existing: list = field(default_factory=list)  # older copy's text inside an existing highlight's
     recovered: list = field(default_factory=list)
     unmatched: list = field(default_factory=list)
 
     def counts(self) -> dict:
-        return {name: len(getattr(self, name)) for name in ("new", "already_present", "recovered", "unmatched")}
+        return {name: len(getattr(self, name)) for name in BUCKETS}
 
     def summary(self) -> list:
-        """Per-book counts, by title: never any highlight text."""
+        """Per-book counts, by title, with a count per reason for the unmatched: never any highlight text."""
         books: dict = {}
-        for bucket in ("new", "already_present", "recovered", "unmatched"):
+        for bucket in BUCKETS:
             for item in getattr(self, bucket):
                 title = item.title or item.row.get("title") or "(unknown book)"
-                entry = books.setdefault(title, dict.fromkeys(("new", "already_present", "recovered", "unmatched"), 0))
+                entry = books.setdefault(title, {**dict.fromkeys(BUCKETS, 0), "reasons": {}})
                 entry[bucket] += 1
+                if bucket == "unmatched" and item.reason:
+                    entry["reasons"][item.reason] = entry["reasons"].get(item.reason, 0) + 1
         return [{"title": title, **counts} for title, counts in sorted(books.items(), key=lambda kv: kv[0].casefold())]
 
 
@@ -118,6 +123,15 @@ def chapter_from_content_id(content_id: Optional[str]) -> Optional[str]:
         return None
     parts = [part for part in content_id.split("!", 1)[1].split("!") if part]
     return "/".join(parts) or None
+
+
+def old_chapter_from_content_id(content_id: Optional[str]) -> Optional[str]:
+    """The chapter path in an older rendition's ContentID: `...epub#(7)OEBPS/x.xhtml` or `...!OEBPS!x.xhtml`."""
+    if not content_id:
+        return None
+    if "#" in content_id:
+        return re.sub(r"^\(\d+\)", "", content_id.split("#", 1)[1]) or None
+    return chapter_from_content_id(content_id)
 
 
 _ROW = """
@@ -249,13 +263,15 @@ class _Catalog:
         return (found[0], None) if len(found) == 1 else (None, "ambiguous_book")
 
 
-def _text_present(key: str, known: list) -> bool:
+def _text_present(key: str, known: list) -> Optional[str]:
+    """"equal" if a known text is the same, "contained" if one holds the other, else None."""
+    contained = False
     for other in known:
         if key == other:
-            return True
+            return "equal"
         if min(len(key), len(other)) >= _CONTAINED_MIN and (key in other or other in key):
-            return True
-    return False
+            contained = True
+    return "contained" if contained else None
 
 
 def _entry(row: dict, chapter: str, progress, start_path, start_char, end_path, end_char) -> dict:
@@ -297,9 +313,14 @@ def plan_import(session, user_id: int, rows, older_rows=(), *,
     that can't be placed in a library book is `unmatched`, with a reason.
 
     `older_rows` are an older database's: each is matched to a library book by
-    title and author, is `already_present` if its text is among the book's
-    highlights (those rows, or the user's, deleted or not) and otherwise placed
-    by finding its text in the book (`recovered`), or `unmatched`.
+    title and author, is `already_present` if its text equals one of the book's
+    highlights (the main rows that are new or already present, or the user's,
+    deleted or not), or `contained_in_existing` if it holds or sits inside one
+    (20 characters or more). Otherwise it is placed by finding its text in the
+    book: in the older rendition's chapter if the library KEPUB has that file
+    and the text is in it, else anywhere in the book. It is `recovered` only if
+    the text occurs exactly once there; a repeated passage is `unmatched`
+    (`ambiguous_text`), never guessed between its copies.
 
     `find_book`, `catalog` and `files` default to the library's lookups.
     """
@@ -338,8 +359,8 @@ def plan_import(session, user_id: int, rows, older_rows=(), *,
         if book is None:
             plan.unmatched.append(PlanItem(row, reason=REASONS["no_book"]))
             continue
-        main_texts.setdefault(book.id, []).append(_words(row["text"]))
         if in_cwa(row["bookmark_id"]):
+            main_texts.setdefault(book.id, []).append(_words(row["text"]))
             plan.already_present.append(PlanItem(row, book.id, book.title))
             continue
         chapter = chapter_from_content_id(row["content_id"])
@@ -349,6 +370,7 @@ def plan_import(session, user_id: int, rows, older_rows=(), *,
         entry = _entry(row, chapter, row["chapter_progress"], row["start_path"], row["start_offset"],
                        row["end_path"], row["end_offset"])
         fields = _stamp(fields_from_entry(books_for(book.id), entry), row)
+        main_texts.setdefault(book.id, []).append(_words(row["text"]))
         plan.new.append(PlanItem(row, book.id, book.title, fields))
 
     older_rows = list(older_rows)
@@ -363,20 +385,33 @@ def plan_import(session, user_id: int, rows, older_rows=(), *,
             if book is None:
                 plan.unmatched.append(PlanItem(row, reason=REASONS[why]))
                 continue
-            if row["bookmark_id"] in main_ids or in_cwa(row["bookmark_id"]) or \
-                    _text_present(_words(row["text"]), known_texts(book.id)):
+            if row["bookmark_id"] in main_ids or in_cwa(row["bookmark_id"]):
                 plan.already_present.append(PlanItem(row, book.id, book.title))
+                continue
+            present = _text_present(_words(row["text"]), known_texts(book.id))
+            if present:
+                bucket = plan.already_present if present == "equal" else plan.contained_in_existing
+                bucket.append(PlanItem(row, book.id, book.title))
                 continue
             opened_books = books_for(book.id).open()
             if opened_books is None:
                 plan.unmatched.append(PlanItem(row, book.id, book.title, reason=REASONS["no_files"]))
                 continue
+            kepub = opened_books[1]
+            progress = row["chapter_progress"] or 0.0
             try:
-                found = locate_text_range(opened_books[1], None, row["text"], row["chapter_progress"] or 0.0)
+                chapter = old_chapter_from_content_id(row["content_id"])
+                if chapter is not None and not count_text_occurrences(kepub, chapter, row["text"]):
+                    chapter = None  # the chapter is not there, or the text isn't in it: the whole book
+                occurrences = count_text_occurrences(kepub, chapter, row["text"])
+                found = locate_text_range(kepub, chapter, row["text"], progress) if occurrences == 1 else None
             except Exception as e:
                 log.warning(f"[highlight-sync] older highlight {row['bookmark_id']}: could not be placed "
                             f"({type(e).__name__})")
-                found = None
+                occurrences, found = 0, None
+            if occurrences > 1:  # never guess between copies of a repeated passage
+                plan.unmatched.append(PlanItem(row, book.id, book.title, reason=REASONS["ambiguous_text"]))
+                continue
             if found is None:
                 plan.unmatched.append(PlanItem(row, book.id, book.title, reason=REASONS["no_text"]))
                 continue

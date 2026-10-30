@@ -213,12 +213,8 @@ def _streams(kepub: EpubBook, paths) -> list:
     return streams
 
 
-def locate_text_range(kepub: EpubBook, chapter: Optional[str], text: str, hint: float) -> Optional[KoboRange]:
-    """The Kobo range covering text, matched ignoring whitespace, nearest hint.
-
-    With a chapter, the search is that KEPUB chapter and hint a fraction of it;
-    with None, every spine chapter in order and hint a fraction of the book.
-    """
+def _search_scope(kepub: EpubBook, chapter: Optional[str], text: str):
+    """(needle, streams, squeezed text, chapter bases) for a text search, or None if nothing can be searched."""
     needle = _squeeze(text).replace(_CHAPTER_BARRIER, '')
     if not needle:
         return None
@@ -239,6 +235,33 @@ def locate_text_range(kepub: EpubBook, chapter: Optional[str], text: str, hint: 
     for _, stream in streams:
         bases.append(base)
         base += len(stream.text) + len(_CHAPTER_BARRIER)
+    return needle, streams, squeezed, bases
+
+
+def count_text_occurrences(kepub: EpubBook, chapter: Optional[str], text: str) -> int:
+    """How many times text occurs, ignoring whitespace, in the chapter (or in the whole book if None).
+
+    Overlapping occurrences count; 0 if the text is empty or the chapter can't be searched.
+    """
+    scope = _search_scope(kepub, chapter, text)
+    if scope is None:
+        return 0
+    needle, _, squeezed, _ = scope
+    return _occurrences_before(squeezed.text, needle, len(squeezed.text) + 1)
+
+
+def locate_text_range(kepub: EpubBook, chapter: Optional[str], text: str, hint: float) -> Optional[KoboRange]:
+    """The Kobo range covering text, matched ignoring whitespace, nearest hint.
+
+    With a chapter, the search is that KEPUB chapter and hint a fraction of it;
+    with None, every spine chapter in order and hint a fraction of the book.
+    Where the text occurs more than once the nearest to the hint is taken: a
+    caller that must not guess checks `count_text_occurrences` first.
+    """
+    scope = _search_scope(kepub, chapter, text)
+    if scope is None:
+        return None
+    needle, streams, squeezed, bases = scope
     expected = squeezed.at(round(min(max(hint, 0.0), 1.0) * len(squeezed.raw)))
     hit = _find(squeezed, needle, expected)
     if hit is None:

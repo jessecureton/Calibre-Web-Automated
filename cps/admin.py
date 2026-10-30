@@ -3192,6 +3192,11 @@ def highlights_import_apply():
     if stash is None:
         flash(_("That import has expired. Upload the database again."), category="error")
         return redirect(url_for("admin.highlights_import"))
+    if ub.session.query(ub.User).filter(ub.User.id == stash.user_id).first() is None:
+        kobo_import.discard_stash(token)
+        flask_session.pop(HIGHLIGHT_IMPORT_SESSION_KEY, None)
+        flash(_("The user to import for no longer exists."), category="error")
+        return redirect(url_for("admin.highlights_import"))
     try:
         rows = kobo_import.read_kobo_highlights(stash.main_path)
         older_rows = kobo_import.read_kobo_highlights(stash.older_path) if stash.older_path else []
