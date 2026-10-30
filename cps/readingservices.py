@@ -239,6 +239,8 @@ def handle_highlight_route(kind, entitlement_id):
         # Never identified as a CWA book, so no CWA set was ever served for it;
         # but it can't be told from a store book now, so neither serve nor proxy.
         log.error(f"[highlight-sync] {request.method} annotations for {entitlement_id}: book lookup failed")
+        if request.method == "PATCH" and current_user.is_authenticated:
+            kobo_side.record_patch_result(current_user.id, entitlement_id, False)
         return make_response("", 503)
     if book_id is None:
         if config.config_kobo_proxy:
@@ -323,13 +325,15 @@ def _count(value):
 
 def _highlight_annotations_patch(entitlement_id, user_id, book_id):
     """Store, then 204 with an empty body. 400 for a body that can't be stored whole
-    and 503 if storing fails, so the Kobo keeps the annotations and retries."""
+    and 503 if storing fails, so the Kobo keeps the annotations and retries; until a
+    PATCH for the book succeeds, checkforchanges doesn't name it."""
     data = request.get_json(silent=True)
     if data is None and not request.get_data().strip():
         data = {}  # an empty PATCH is a legitimate no-op
     error = "unreadable JSON" if data is None else kobo_side.kobo_patch_error(data)
     if error:
         log.warning(f"[highlight-sync] user={user_id} book={book_id}: rejected annotations PATCH ({error})")
+        kobo_side.record_patch_result(user_id, entitlement_id, False)
         return make_response(jsonify({"error": error}), 400)
     try:
         kobo_side.apply_kobo_patch(ub.session, user_id, book_id, data, datetime.now(timezone.utc),
@@ -341,7 +345,9 @@ def _highlight_annotations_patch(entitlement_id, user_id, book_id):
                     f"deleted={_count(data.get('deletedAnnotationIds'))}) failed "
                     f"({type(e).__name__}); answering 503")
         _rollback()
+        kobo_side.record_patch_result(user_id, entitlement_id, False)
         return make_response("", 503)
+    kobo_side.record_patch_result(user_id, entitlement_id, True)
     if config.config_hardcover_annotations_sync and config.config_kobo_sync:
         try:
             process_hardcover_patch(entitlement_id, data)

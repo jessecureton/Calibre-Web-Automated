@@ -478,6 +478,21 @@ def kobo_annotation_set(session, user_id: int, book_id: int, kepub_path: Optiona
     return {"annotations": entries, "nextPageOffsetToken": None}, kobo_etag(version, bool(withheld))
 
 
+# (user id, ContentId) of the books whose last annotations PATCH CWA answered with an
+# error. The Kobo still holds what that PATCH carried; naming the book now would have
+# it GET a set without those highlights and delete them. In-process: a restart forgets
+# it, and the Kobo retries its PATCH on its next sync anyway.
+_failed_patches: set = set()
+
+
+def record_patch_result(user_id: int, content_id: str, ok: bool) -> None:
+    """Remember whether CWA stored the last annotations PATCH for a user's book."""
+    if ok:
+        _failed_patches.discard((user_id, content_id))
+    else:
+        _failed_patches.add((user_id, content_id))
+
+
 def kobo_changed_books(session, user_id: int, entries: list, firmware: Optional[str],
                        book_id_for: Optional[Callable[[str], Optional[int]]] = None) -> list:
     """
@@ -485,8 +500,9 @@ def kobo_changed_books(session, user_id: int, entries: list, firmware: Optional[
 
     A CWA book is named when its `kobo_etag_version` is above 0 and the ETag the
     device sent differs from `W/"cwa-<kobo_etag_version>"`. Nothing is named unless highlight sync is on and
-    the firmware is one the admin verified. `book_id_for` maps a ContentId to a CWA
-    book id, or None for a book CWA doesn't own.
+    the firmware is one the admin verified. A book whose last PATCH failed
+    (`record_patch_result`) is not named until a PATCH for it succeeds.
+    `book_id_for` maps a ContentId to a CWA book id, or None for a book CWA doesn't own.
     """
     if not delivers_to(firmware):
         return []
@@ -499,6 +515,8 @@ def kobo_changed_books(session, user_id: int, entries: list, firmware: Optional[
             continue
         content_id = entry.get("ContentId")
         if not isinstance(content_id, str) or content_id in named:
+            continue
+        if (user_id, content_id) in _failed_patches:
             continue
         book_id = lookup(content_id)
         if book_id is None:

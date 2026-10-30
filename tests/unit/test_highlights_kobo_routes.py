@@ -85,6 +85,7 @@ class FakeCalibre:
 def fresh_caches(monkeypatch):
     monkeypatch.setattr(readingservices, "_known_books", {})
     monkeypatch.setattr(settings, "_ever_seen", set())
+    monkeypatch.setattr(kobo_side, "_failed_patches", set())
 
 
 @pytest.fixture
@@ -502,6 +503,31 @@ class TestCheckForChanges:
         assert r.get_json() == [UUID]
         client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
         assert rollbacks == []
+
+    def test_a_book_whose_patch_failed_is_not_named_until_a_patch_succeeds(self, client, session, monkeypatch):
+        """Named after a failed PATCH, the Kobo's GET would delete the highlights that PATCH carried."""
+        real = kobo_side.apply_kobo_patch
+
+        def boom(*a, **k):
+            raise RuntimeError("database is locked")
+        monkeypatch.setattr(kobo_side, "apply_kobo_patch", boom)
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        assert r.status_code == 503
+        # Readest changes the book meanwhile, so its version moves past the device's ETag.
+        upsert_from_side(session, USER, BOOK, "readest", "rk-1",
+                         {"text": "From Readest", "xp0": CROSS_CHAPTER[0], "xp1": CROSS_CHAPTER[1]}, T0)
+        session.commit()
+        assert etag_version(session) == 1
+        batch = [{"ContentId": UUID, "etag": 'W/"0"'}]
+        assert client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS).get_json() == []
+        # A rejected body counts as failed too.
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json={"updatedAnnotations": "x"}, headers=HEADERS)
+        assert r.status_code == 400
+        assert client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS).get_json() == []
+        monkeypatch.setattr(kobo_side, "apply_kobo_patch", real)
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        assert r.status_code == 204
+        assert client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS).get_json() == [UUID]
 
     def test_all_cwa_batch_is_not_proxied(self, client, session, monkeypatch):
         no_proxy(monkeypatch)
