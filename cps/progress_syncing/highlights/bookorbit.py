@@ -46,14 +46,29 @@ What CWA adds on top:
   same as an unknown URL, so a server without the setting looks as it did.
 - One Readest install per user: the first deviceId is recorded; any other gets
   409 with a message.
-- Mass deletions are held: if one complete key list drops every live
-  Readest-known highlight of a book, or more than half of them when there are
-  more than 3, nothing is deleted and the counts are logged. The exchange is
-  still answered normally (with no deletes and no edits for the held
-  highlights), so Readest's pass completes and doesn't repeat. Readest never
-  retries a deletion on its own: each later complete key list is judged again,
-  so the hold lasts until the highlights reappear in Readest's keys, or they go
-  in smaller steps.
+- Deletions: a highlight is deleted by its key's absence from a complete list
+  only once Readest has listed that key (in a complete list, or as a change)
+  since CWA recorded it. A key recorded from an add ack that Readest then
+  doesn't list (the add landed on a Readest tombstone of the same position,
+  which stays deleted: useBookOrbitNotesSync.ts:139-147) is dropped and the
+  highlight left undelivered and logged, never deleted.
+- Mass deletions are held: if one complete key list drops at least 4 of a
+  book's live Readest-known highlights, and that is all or more than half of
+  them, nothing is deleted, the counts are logged and the highlights are marked
+  held. The exchange is still answered normally (no deletes, and no edits for
+  keys Readest didn't list), so Readest's pass completes and doesn't repeat.
+  The hold is sticky: held highlights are left out of later deletion counts
+  until their keys reappear (which lifts the hold) or an admin releases them
+  with `release_held_deletions`, which applies the deletion.
+- Adds wait for Readest's changes: while a pass may still bring changes (a
+  complete list naming keys CWA doesn't know beyond this request's changes, or
+  a later chunk carrying changes), adds are withheld and `more` is true, so
+  Readest sends one empty exchange after its last chunk, which carries them.
+  Otherwise an add could duplicate a passage Readest's later chunk merges.
+- An add whose ack was lost is recovered by its key (the minted datetime and the
+  xp0 CWA sent), not by text, from Readest's key list or its echo. A highlight
+  deleted between an offer and its ack still gets its key, so the delete is
+  offered next.
 - A change whose key is new but whose datetime belongs to exactly one live
   Readest-known highlight whose key has dropped out of the complete list is
   that highlight moved in Readest. It keeps its row and its Kobo id, and its
@@ -76,7 +91,9 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ... import constants, csrf, logger, ub
 from .. import settings
-from .store import Highlight, HighlightDevice, _utc, delete_from_side, upsert_from_side
+from .store import (
+    CONTENT_FIELDS, Highlight, HighlightDevice, _utc, delete_from_side, upsert_from_side,
+)
 
 # The protocols package re-exports the kosync blueprint under the module's name.
 kosync_protocol = importlib.import_module("..protocols.kosync", __package__)
@@ -101,10 +118,6 @@ READEST_TO_KO_COLOR = {readest: ko for ko, readest in KO_TO_READEST_COLOR.items(
 
 KOBO_RANGE_FIELDS = ("kobo_chapter", "kobo_start_path", "kobo_start_char",
                      "kobo_end_path", "kobo_end_char", "kobo_chapter_progress")
-
-# (user_id, book_id) -> (missing, known) of the hold last logged at WARNING, so a
-# hold that every pass re-finds is logged once, not on every pass.
-_held_logged = {}
 
 
 class BadRequest(Exception):
@@ -138,7 +151,8 @@ def _error(status: int, message: str):
 
 
 def _is_mass_deletion(missing: int, known: int) -> bool:
-    return known > 0 and (missing == known or (known > 3 and missing * 2 > known))
+    """At least 4 deletions in one pass that are all, or more than half, of the book's highlights."""
+    return missing >= 4 and missing * 2 > known
 
 
 # --- request gate -----------------------------------------------------------------
@@ -266,6 +280,28 @@ def _moved_row(session, user_id: int, book_id: int, datetime_: str, keys: set) -
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _offered_row(session, user_id: int, book_id: int, key: str) -> Optional[Highlight]:
+    """
+    A keyless highlight CWA offered Readest under this key (its minted datetime and
+    its xp0), whose ack never arrived. Matched by key, not text, and deleted rows
+    included, so the recovery can't land on another copy of the passage or bring
+    a deleted highlight back.
+    """
+    for row in session.query(Highlight).filter(
+            Highlight.user_id == user_id, Highlight.book_id == book_id,
+            Highlight.readest_key.is_(None), Highlight.readest_datetime.isnot(None),
+            Highlight.xp0.isnot(None)).order_by(Highlight.id):
+        if bookorbit_key(row.readest_datetime, row.xp0) == key:
+            return row
+    return None
+
+
+def _change_key(ann) -> Optional[str]:
+    if isinstance(ann, dict) and isinstance(ann.get("datetime"), str) and isinstance(ann.get("pos0"), str):
+        return bookorbit_key(ann["datetime"], ann["pos0"])
+    return None
+
+
 def _apply_change(session, user_id: int, book_id: int, ann, keys: set, complete: bool,
                   now: datetime) -> bool:
     """Store one KoAnnotation from Readest; False if it can't be used."""
@@ -293,6 +329,13 @@ def _apply_change(session, user_id: int, book_id: int, ann, keys: set, complete:
         log.warning(f"[highlight-sync] user={user_id} book={book_id}: a Readest key already belongs "
                     f"to highlight {row.id} in book {row.book_id}; change ignored")
         return False
+    if row is None:
+        row = _offered_row(session, user_id, book_id, key)
+        if row is not None:
+            log.info(f"[highlight-sync] user={user_id} book={book_id}: highlight {row.id} recovered "
+                     f"from an add whose ack was lost")
+            row.readest_key = key
+            session.flush()
     if row is None and complete:
         row = _moved_row(session, user_id, book_id, datetime_, keys)
         if row is not None:
@@ -304,36 +347,97 @@ def _apply_change(session, user_id: int, book_id: int, ann, keys: set, complete:
         # Kobo is served the moved highlight under the same id.
         fields.update({name: None for name in KOBO_RANGE_FIELDS})
     row = upsert_from_side(session, user_id, book_id, "readest", key, fields, now)
-    if row.updated_at is not None and _utc(row.updated_at) == updated:
+    row.readest_seen, row.readest_held = True, False
+    if row.deleted_at is None and all(getattr(row, name) == value for name, value in fields.items()
+                                      if name in CONTENT_FIELDS):
         row.readest_version = max(row.readest_version or 0, row.version)  # Readest holds this content
     return True
 
 
-def _apply_deletions(session, user_id: int, book_id: int, keys: set, now: datetime) -> None:
-    """Delete the Readest-known highlights missing from a complete key list, unless that is a mass deletion."""
-    known = session.query(Highlight).filter(
-        Highlight.user_id == user_id, Highlight.book_id == book_id,
-        Highlight.readest_key.isnot(None), Highlight.deleted_at.is_(None)).all()
-    missing = [row for row in known if row.readest_key not in keys]
+def _apply_key_list(session, user_id: int, book_id: int, keys: set, now: datetime) -> set:
+    """
+    Reconcile a book with Readest's complete key list. Returns the listed keys
+    CWA holds no highlight for.
+
+    - A keyless highlight offered under a listed key (lost ack) gets its key.
+    - Listed keys are seen, and a hold on them is lifted.
+    - A live key recorded from an add ack but not listed (the add landed on a
+      Readest tombstone, which stays deleted) is marked failed: the key is
+      dropped and the highlight left undelivered, not deleted.
+    - Seen, unheld keys missing from the list are Readest's deletions, applied
+      unless they are a mass deletion, which is held until the keys reappear or
+      an admin releases it (`release_held_deletions`).
+    """
+    rows = session.query(Highlight).filter(
+        Highlight.user_id == user_id, Highlight.book_id == book_id).order_by(Highlight.id).all()
+    known_keys = {row.readest_key for row in rows if row.readest_key}
+    for row in rows:
+        if row.readest_key is None and row.readest_datetime and row.xp0:
+            key = bookorbit_key(row.readest_datetime, row.xp0)
+            if key in keys and key not in known_keys and session.query(Highlight.id).filter(
+                    Highlight.user_id == user_id, Highlight.readest_key == key).first() is None:
+                log.info(f"[highlight-sync] user={user_id} book={book_id}: highlight {row.id} recovered "
+                         f"from an add whose ack was lost")
+                row.readest_key = key
+                known_keys.add(key)
+    unknown = keys - known_keys
+
+    failed, candidates = [], []
+    for row in rows:
+        if not row.readest_key:
+            continue
+        if row.readest_key in keys:
+            row.readest_seen, row.readest_held = True, False
+        elif row.deleted_at is None and not row.readest_seen:
+            failed.append(row.id)
+            row.readest_key, row.readest_version = None, None
+            row.readest_failed_version = row.version
+            continue
+        if row.deleted_at is None and row.readest_seen and not row.readest_held:
+            candidates.append(row)
+    if failed:
+        log.warning(f"[highlight-sync] user={user_id} book={book_id}: Readest acked but doesn't list "
+                    f"highlights {failed}; left undelivered")
+    session.flush()
+
+    missing = [row for row in candidates if row.readest_key not in keys]
     if not missing:
-        _held_logged.pop((user_id, book_id), None)
-        return
-    if _is_mass_deletion(len(missing), len(known)):
-        signature = (len(missing), len(known))
-        message = (f"[highlight-sync] user={user_id} book={book_id}: held a Readest deletion of "
-                   f"{len(missing)} of {len(known)} highlights")
-        if _held_logged.get((user_id, book_id)) != signature:
-            log.warning(message)
-            _held_logged[(user_id, book_id)] = signature
-        else:
-            log.debug(message)
-        return
-    _held_logged.pop((user_id, book_id), None)
+        return unknown
+    if _is_mass_deletion(len(missing), len(candidates)):
+        for row in missing:
+            row.readest_held = True
+        log.warning(f"[highlight-sync] user={user_id} book={book_id}: held a Readest deletion of "
+                    f"{len(missing)} of {len(candidates)} highlights")
+        return unknown
     for row in missing:
         delete_from_side(session, user_id, book_id, "readest", row.readest_key, now)
         row.readest_version = max(row.readest_version or 0, row.version)
     log.info(f"[highlight-sync] user={user_id} book={book_id}: Readest deleted "
              f"{[row.id for row in missing]}")
+    return unknown
+
+
+def release_held_deletions(session, user_id: int, book_id: Optional[int] = None,
+                           now: Optional[datetime] = None) -> int:
+    """
+    Apply the user's held Readest deletions (in one book, or all books): each held
+    highlight still live is deleted as Readest asked, and every hold is cleared.
+    Returns how many highlights were deleted. The caller commits.
+    """
+    now = now or _now()
+    query = session.query(Highlight).filter(Highlight.user_id == user_id, Highlight.readest_held.is_(True))
+    if book_id is not None:
+        query = query.filter(Highlight.book_id == book_id)
+    deleted = 0
+    for row in query.all():
+        row.readest_held = False
+        if row.deleted_at is None and row.readest_key:
+            delete_from_side(session, user_id, row.book_id, "readest", row.readest_key, now)
+            row.readest_version = max(row.readest_version or 0, row.version)
+            deleted += 1
+    session.flush()
+    log.info(f"[highlight-sync] user={user_id} book={book_id}: released {deleted} held Readest deletion(s)")
+    return deleted
 
 
 def _mint_datetime(session, row: Highlight, now: datetime) -> str:
@@ -372,13 +476,14 @@ def _edit_entry(row: Highlight, now: datetime) -> dict:
     }
 
 
-def _to_apply(session, user_id: int, book_id: int, keys: Optional[set], now: datetime) -> tuple:
+def _to_apply(session, user_id: int, book_id: int, keys: Optional[set], offer_adds: bool,
+              now: datetime) -> tuple:
     """
-    (toApply, skippedNoPosition) for a book. `keys` is None when the list wasn't
-    complete. With a complete list, edits go only to keys Readest listed: one it
-    doesn't hold (a held deletion) would only be acked failed.
+    (toApply, skippedNoPosition, adds_withheld) for a book. `keys` is None when
+    the list wasn't complete. With a complete list, edits go only to keys Readest
+    listed: one it doesn't hold (a held deletion) would only be acked failed.
     """
-    add, edit, delete, skipped = [], [], [], 0
+    add, edit, delete, skipped, withheld = [], [], [], 0, False
     rows = session.query(Highlight).filter(
         Highlight.user_id == user_id, Highlight.book_id == book_id,
         or_(Highlight.deleted_at.is_(None), Highlight.readest_key.isnot(None)),
@@ -386,8 +491,12 @@ def _to_apply(session, user_id: int, book_id: int, keys: Optional[set], now: dat
     for row in rows:
         failed = row.readest_failed_version == row.version
         if row.readest_key is None:
+            if row.deleted_at is not None:
+                continue
             if not row.xp0:
                 skipped += 1
+            elif not failed and not offer_adds:
+                withheld = True
             elif not failed:
                 add.append(_add_entry(row, row.readest_datetime or _mint_datetime(session, row, now)))
             continue
@@ -398,10 +507,19 @@ def _to_apply(session, user_id: int, book_id: int, keys: Optional[set], now: dat
                            "datetime": row.readest_datetime})
         elif keys is None or row.readest_key in keys:
             edit.append(_edit_entry(row, now))
-    return {"add": add, "edit": edit, "delete": delete}, skipped
+    return {"add": add, "edit": edit, "delete": delete}, skipped, withheld
 
 
 def _exchange_book(session, user_id: int, book_id: int, req: dict, now: datetime) -> dict:
+    """
+    One ExchangeBookRequest. Adds are withheld, with `more: true`, while Readest
+    may still be sending changes in this pass: a complete list naming keys CWA
+    doesn't know that aren't among this request's changes (they come in later
+    chunks), or any later chunk that carries changes. Readest's changes may merge
+    with the very highlights an early add would duplicate. `more` makes Readest
+    send one empty exchange after its last chunk (notesPass.ts:132-136), which
+    then carries the adds.
+    """
     keys_in, changes = req.get("keys") or [], req.get("changes") or []
     if not isinstance(keys_in, list) or not isinstance(changes, list):
         raise BadRequest("keys and changes must be lists")
@@ -413,15 +531,19 @@ def _exchange_book(session, user_id: int, book_id: int, req: dict, now: datetime
         log.warning(f"[highlight-sync] user={user_id} book={book_id}: ignored {unusable} unusable "
                     f"Readest change(s)")
     if complete:
-        _apply_deletions(session, user_id, book_id, keys, now)
-    to_apply, skipped = _to_apply(session, user_id, book_id, keys if complete else None, now)
+        unknown = _apply_key_list(session, user_id, book_id, keys, now)
+        offer_adds = not (unknown - {_change_key(ann) for ann in changes})
+    else:
+        offer_adds = not changes
+    to_apply, skipped, withheld = _to_apply(
+        session, user_id, book_id, keys if complete else None, offer_adds, now)
     session.commit()
     if to_apply["add"] or to_apply["edit"] or to_apply["delete"]:
         log.info(f"[highlight-sync] user={user_id} book={book_id}: offered Readest "
                  f"add={[e['serverId'] for e in to_apply['add']]} "
                  f"edit={[e['serverId'] for e in to_apply['edit']]} "
                  f"delete={[e['serverId'] for e in to_apply['delete']]}")
-    return {"hash": req["hash"], "bookId": book_id, "toApply": to_apply, "more": False,
+    return {"hash": req["hash"], "bookId": book_id, "toApply": to_apply, "more": withheld,
             "skippedNoPosition": skipped}
 
 
@@ -465,18 +587,21 @@ def _ack_applied(session, user_id: int, book_id: int, entry) -> None:
     if row.readest_key is None:
         # An add. Readest keys the note by the datetime and pos0 CWA sent; a
         # corrected pos0 in the ack never reaches the note (annotationExchange.ts).
-        if row.deleted_at is not None or not row.xp0 or not row.readest_datetime:
+        # A highlight deleted since the offer is keyed all the same, so the next
+        # pass offers Readest the delete instead of the note coming back.
+        if not row.xp0 or not row.readest_datetime:
             log.warning(f"[highlight-sync] user={user_id} book={book_id}: ack for highlight {row.id} "
-                        f"that is no longer offered")
+                        f"that was never offered")
             return
         key = bookorbit_key(row.readest_datetime, row.xp0)
         clash = session.query(Highlight.id).filter(
             Highlight.user_id == user_id, Highlight.readest_key == key, Highlight.id != row.id).first()
         if clash is not None:
+            row.readest_failed_version = version
             log.warning(f"[highlight-sync] user={user_id} book={book_id}: highlight {row.id}'s Readest "
                         f"key is held by highlight {clash[0]}; left undelivered")
             return
-        row.readest_key = key
+        row.readest_key, row.readest_seen = key, False  # seen once Readest lists it
         if entry.get("pos0") and entry["pos0"] != row.xp0:
             log.debug(f"[highlight-sync] highlight {row.id}: Readest reported a corrected position")
     row.readest_version = max(row.readest_version or 0, version)

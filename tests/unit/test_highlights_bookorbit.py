@@ -175,14 +175,18 @@ class FakeReadest:
         now = self.now()
         for add in result["toApply"]["add"]:
             nid = bookorbit_note_id(self.hash, add["pos0"], add["pos1"])
+            # No deletedAt: mergeNotes spreads the upsert over an existing note of the
+            # same position-derived id, so a tombstone stays deleted
+            # (useBookOrbitNotesSync.ts:139-147).
             upsert = {"id": nid, "type": "annotation", "xpointer0": add["pos0"],
                       "xpointer1": add["pos1"], "text": add["text"], "note": add["note"] or "",
                       "color": KO_TO_READEST_COLOR.get(add["color"]), "style": "highlight",
-                      "createdAt": parse_ko_datetime(add["datetime"]), "updatedAt": now,
-                      "deletedAt": None}
+                      "createdAt": parse_ko_datetime(add["datetime"]), "updatedAt": now}
             existing = self.notes.get(nid)
-            if existing is None or existing["updatedAt"] <= now:
-                self.notes[nid] = {**(existing or {}), **upsert}
+            if existing is None:
+                self.notes[nid] = {"deletedAt": None, **upsert}
+            elif existing["updatedAt"] <= now:
+                self.notes[nid] = {**existing, **upsert}
             applied.append({"serverId": add["serverId"], "version": add["version"],
                             "status": "applied", "verified": True})
             identities.append((nid, add["datetime"], add["serverId"]))
@@ -204,8 +208,22 @@ class FakeReadest:
             deleted.append({"serverId": entry["serverId"], "status": "applied"})
         return {"hash": result["hash"], "applied": applied, "deleted": deleted}, identities
 
-    # notesPass.runBookOrbitNotesPass + exchangeNotes (one chunk)
-    def run_pass(self):
+    class AckLost(Exception):
+        pass
+
+    # notesPass.runBookOrbitNotesPass + exchangeNotes / runPhase: chunks of 50
+    # changes, keys only on chunk 0, then empty exchanges while `more`.
+    def run_pass(self, chunk_size=50, lose_ack=False, before_ack=None):
+        """
+        One pass. Returns the book's results merged: every response's toApply
+        lists concatenated, `more` of the last response, `skippedNoPosition` of
+        the first, and `responses` (each ExchangeBookResult).
+
+        lose_ack: the ack request fails, as a network error would; Readest's
+        exchange callback throws, so the pass ends before identities are stored
+        or the watermark moves (notesPass.ts:165-190, 141).
+        before_ack: called between an exchange's answer and its ack.
+        """
         match = self.post("/plugin/match-check", {
             "hashes": [self.hash],
             "books": [{"hash": self.hash, "title": "Book", "lastOpen": self.clock // 1000,
@@ -214,20 +232,52 @@ class FakeReadest:
             return "unmatched"
         request, key_to_note = self.build_request()
         pass_start = self.now()
-        response = self.post("/plugin/annotations/exchange", {"books": [request]})
-        if self.hash in response["unmatched"]:
-            return "unmatched"
-        result = next((r for r in response["results"] if r["hash"] == self.hash), None)
-        if result is None:
+        results = []
+
+        def exchange_chunk(chunk_request):
+            response = self.post("/plugin/annotations/exchange", {"books": [chunk_request]})
+            if self.hash in response["unmatched"]:
+                return None
+            result = next((r for r in response["results"] if r["hash"] == self.hash), None)
+            if result is None:
+                return False
+            results.append(result)
+            ack, identities = self.apply(result, key_to_note)
+            if before_ack:
+                before_ack(result)
+            if ack["applied"] or ack["deleted"]:
+                if lose_ack:
+                    raise FakeReadest.AckLost()
+                self.post("/plugin/annotations/exchange-ack", {"books": [ack]})
+            for nid, dt, server_id in identities:
+                self.identities[nid] = {"datetime": dt, "serverId": server_id}
+            return result["more"]
+
+        changes = request["changes"]
+        chunks = [changes[i:i + chunk_size] for i in range(0, len(changes), chunk_size)] or [[]]
+        try:
+            more = False
+            for i, chunk in enumerate(chunks):
+                more = exchange_chunk({"hash": self.hash, "keys": request["keys"] if i == 0 else [],
+                                       "keysComplete": i == 0, "changes": chunk})
+                if more is None:
+                    return "unmatched"
+            follow_ups = 0
+            while more:
+                follow_ups += 1
+                assert follow_ups < 10, "server keeps answering more: true"
+                more = exchange_chunk({"hash": self.hash, "keys": [], "keysComplete": False,
+                                       "changes": []})
+        except FakeReadest.AckLost:
+            return "ack lost"
+        if not results:
             return None
-        ack, identities = self.apply(result, key_to_note)
-        if ack["applied"] or ack["deleted"]:
-            self.post("/plugin/annotations/exchange-ack", {"books": [ack]})
-        for nid, dt, server_id in identities:
-            self.identities[nid] = {"datetime": dt, "serverId": server_id}
-        assert result["more"] is False
         self.watermark = pass_start
-        return result
+        return {"hash": self.hash, "more": results[-1]["more"],
+                "skippedNoPosition": results[0]["skippedNoPosition"],
+                "toApply": {kind: [e for r in results for e in r["toApply"][kind]]
+                            for kind in ("add", "edit", "delete")},
+                "responses": results}
 
 
 # --- fixtures -------------------------------------------------------------------
@@ -235,7 +285,6 @@ class FakeReadest:
 @pytest.fixture(autouse=True)
 def fresh(monkeypatch):
     monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: True)
-    monkeypatch.setattr(bookorbit, "_held_logged", {})
 
 
 @pytest.fixture
@@ -505,16 +554,80 @@ def test_mass_deletion_is_held(readest, session, caplog):
     assert "passage" not in caplog.text
 
 
-def test_more_than_half_is_held_but_half_is_applied(readest, session):
-    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 7)]  # 5
+def test_more_than_half_of_at_least_four_is_held(readest, session):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 9)]  # 7
     readest.run_pass()
-    for nid in ids[:3]:
+    for nid in ids[:4]:
         readest.delete(nid)
     readest.run_pass()
-    assert all(r.deleted_at is None for r in rows(session))            # 3 of 5: held
-    readest.notes[ids[2]]["deletedAt"] = None                           # undo one
+    assert all(r.deleted_at is None for r in rows(session))            # 4 of 7: held
+    assert sum(r.readest_held for r in rows(session)) == 4
+
+
+def test_half_is_applied(readest, session):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 10)]  # 8
     readest.run_pass()
-    assert sum(r.deleted_at is not None for r in rows(session)) == 2   # 2 of 5: applied
+    for nid in ids[:4]:
+        readest.delete(nid)
+    readest.run_pass()
+    assert sum(r.deleted_at is not None for r in rows(session)) == 4   # 4 of 8: applied
+
+
+def test_small_deletions_always_propagate(readest, session):
+    # Ruling A: fewer than 4 deletions in a pass are never held, even all of a book's.
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 5)]  # 3
+    readest.run_pass()
+    for nid in ids:
+        readest.delete(nid)
+    assert readest.run_pass()["toApply"] == {"add": [], "edit": [], "delete": []}
+    assert all(r.deleted_at is not None for r in rows(session))
+
+
+def test_held_deletion_is_sticky(readest, session):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 6)]  # 4
+    readest.run_pass()
+    for nid in ids:
+        readest.delete(nid)
+    readest.run_pass()
+    # Later activity: 5 new highlights. 4 missing of 9 would not be a mass deletion,
+    # but the hold stands.
+    for n in range(10, 15):
+        readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}")
+    readest.run_pass()
+    readest.run_pass()
+    assert len(rows(session)) == 9
+    assert all(r.deleted_at is None for r in rows(session))
+    assert sum(r.readest_held for r in rows(session)) == 4
+
+
+def test_hold_clears_when_the_key_reappears(readest, session):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 6)]
+    readest.run_pass()
+    for nid in ids:
+        readest.delete(nid)
+    readest.run_pass()
+    readest.notes[ids[0]]["deletedAt"] = None        # back in Readest's key list
+    readest.run_pass()
+    first = rows(session)[0]
+    assert not first.readest_held and sum(r.readest_held for r in rows(session)) == 3
+    readest.delete(ids[0])                           # now a lone deletion
+    readest.run_pass()
+    assert rows(session)[0].deleted_at is not None
+    assert all(r.deleted_at is None for r in rows(session)[1:])
+
+
+def test_release_held_deletions_applies_them(readest, session):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 6)]
+    readest.run_pass()
+    for nid in ids:
+        readest.delete(nid)
+    readest.run_pass()
+    assert bookorbit.release_held_deletions(session, USER, BOOK) == 4
+    session.commit()
+    assert all(r.deleted_at is not None and not r.readest_held for r in rows(session))
+    # Readest already deleted them: nothing is offered back.
+    assert readest.run_pass()["toApply"] == {"add": [], "edit": [], "delete": []}
+    assert bookorbit.release_held_deletions(session, USER) == 0
 
 
 def test_held_highlight_is_not_offered_as_edit(readest, session):
@@ -704,3 +817,142 @@ def test_corrected_pos0_in_ack_does_not_change_the_key(client, session):
     [row] = rows(session)
     assert row.readest_key == bookorbit_key(add["datetime"], xp(3, 0))
     assert (row.xp0, row.xp1) == (xp(3, 0), xp(3, 20))
+
+
+# --- fix round 1 ------------------------------------------------------------------
+
+def live_notes(readest):
+    return [n for n in readest.notes.values() if not n["deletedAt"]]
+
+
+def test_readd_into_a_readest_tombstone_is_not_deleted_from_the_kobo(readest, session):
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "The same passage")
+    readest.run_pass()                                  # offered, applied, acked
+    readest.run_pass()                                  # Readest lists the key
+    [nid] = readest.notes
+    readest.delete(nid)
+    readest.run_pass()
+    assert rows(session)[0].deleted_at is not None      # a lone deletion propagates
+    # The Kobo highlights the same passage again: a new Kobo id, the same position,
+    # so Readest's add lands on its tombstone (same note id) and stays deleted.
+    kobo_highlight(session, "kobo-2", xp(3, 0), xp(3, 20), "The same passage",
+                   at=datetime.now(timezone.utc))
+    result = readest.run_pass()
+    assert [a["text"] for a in result["toApply"]["add"]] == ["The same passage"]
+    assert live_notes(readest) == [] and len(readest.notes) == 1
+    for _ in range(3):
+        result = readest.run_pass()
+        assert result["toApply"] == {"add": [], "edit": [], "delete": []}
+    again = [r for r in rows(session) if r.kobo_id == "kobo-2"][0]
+    assert again.deleted_at is None                     # still on the Kobo
+    assert again.readest_key is None and again.readest_failed_version == again.version
+
+
+def test_chunked_exchange_with_60_overlapping_highlights_does_not_duplicate(readest, session):
+    # The same 60 passages, highlighted on the Kobo and in Readest before either synced.
+    for n in range(2, 62):
+        kobo_highlight(session, f"kobo-{n}", xp(n, 0), xp(n, 9), f"passage {n}")
+        readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}")
+    result = readest.run_pass(chunk_size=50)
+    assert len(result["responses"]) >= 2
+    assert result["toApply"]["add"] == []
+    assert len(rows(session)) == 60
+    assert all(r.readest_key and r.kobo_id for r in rows(session))
+    assert len(live_notes(readest)) == 60 and len(readest.notes) == 60
+    assert readest.run_pass()["toApply"] == {"add": [], "edit": [], "delete": []}
+    assert len(rows(session)) == 60 and all(r.deleted_at is None for r in rows(session))
+
+
+def test_three_chunks_with_overlapping_highlights_do_not_duplicate(readest, session):
+    # 120 changes: chunks of 50, 50 and 20. The middle chunk mustn't carry adds
+    # that the last chunk's changes would have merged.
+    for n in range(2, 122):
+        kobo_highlight(session, f"kobo-{n}", xp(n, 0), xp(n, 9), f"passage {n}")
+        readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}")
+    result = readest.run_pass(chunk_size=50)
+    assert len(result["responses"]) >= 3
+    assert result["toApply"]["add"] == []
+    assert len(rows(session)) == 120 and len(readest.notes) == 120
+
+
+def test_chunked_exchange_still_delivers_kobo_only_highlights(readest, session):
+    for n in range(2, 62):
+        kobo_highlight(session, f"kobo-{n}", xp(n, 0), xp(n, 9), f"passage {n}")
+        readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}")
+    kobo_highlight(session, "kobo-only", xp(80, 0), xp(80, 9), "only on the Kobo")
+    result = readest.run_pass(chunk_size=50)
+    assert [a["text"] for a in result["toApply"]["add"]] == ["only on the Kobo"]
+    assert len(rows(session)) == 61 and len(live_notes(readest)) == 61
+    assert result["more"] is False
+
+
+def test_lost_ack_then_echo_recovers_each_row_by_key(readest, session):
+    # Two highlights of the same phrase in one chapter, so a text merge can't tell
+    # them apart. Created out of id order, so Readest holds them in the other order.
+    base = datetime.now(timezone.utc) - timedelta(hours=2)
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 7), "the end", at=base + timedelta(minutes=1))
+    kobo_highlight(session, "kobo-2", xp(9, 0), xp(9, 7), "the end", at=base)
+    assert readest.run_pass(lose_ack=True) == "ack lost"
+    assert all(r.readest_key is None for r in rows(session))
+    readest.run_pass()                                   # echoes both notes as changes
+    by_kobo = {r.kobo_id: r for r in rows(session)}
+    assert (by_kobo["kobo-1"].xp0, by_kobo["kobo-2"].xp0) == (xp(3, 0), xp(9, 0))
+    for row in rows(session):
+        assert row.readest_key == bookorbit_key(row.readest_datetime, row.xp0)
+    assert len(rows(session)) == 2 and len(readest.notes) == 2
+    assert readest.run_pass()["toApply"] == {"add": [], "edit": [], "delete": []}
+
+
+def test_ack_whose_key_is_taken_is_marked_failed(client, session):
+    a = kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "first")
+    b = kobo_highlight(session, "kobo-2", xp(5, 0), xp(5, 20), "second")
+    r = exchange(client, [{"hash": HASH, "keys": [], "keysComplete": True, "changes": []}])
+    add = [e for e in r["results"][0]["toApply"]["add"] if e["serverId"] == a.id][0]
+    b_row = session.get(Highlight, b.id)
+    b_row.readest_key = bookorbit_key(add["datetime"], add["pos0"])
+    session.commit()
+    client.post(PREFIX + "/plugin/annotations/exchange-ack", headers=AUTH, json={
+        "deviceId": DEVICE, "books": [{"hash": HASH, "deleted": [], "applied": [
+            {"serverId": a.id, "version": add["version"], "status": "applied"}]}]})
+    row = session.get(Highlight, a.id)
+    session.refresh(row)
+    assert row.readest_key is None and row.readest_failed_version == row.version
+    r = exchange(client, [{"hash": HASH, "keys": [], "keysComplete": True, "changes": []}])
+    assert a.id not in [e["serverId"] for e in r["results"][0]["toApply"]["add"]]
+
+
+def test_row_deleted_between_offer_and_ack_is_deleted_in_readest(readest, session):
+    from cps.progress_syncing.highlights.store import delete_from_side
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "From the Kobo")
+
+    def kobo_deletes(result):
+        delete_from_side(session, USER, BOOK, "kobo", "kobo-1", datetime.now(timezone.utc))
+        session.commit()
+    readest.run_pass(before_ack=kobo_deletes)
+    assert live_notes(readest) != []                     # Readest applied it
+    assert rows(session)[0].readest_key is not None      # keyed although deleted
+    result = readest.run_pass()
+    assert len(result["toApply"]["delete"]) == 1
+    assert live_notes(readest) == []
+    assert len(rows(session)) == 1 and rows(session)[0].deleted_at is not None
+    assert readest.run_pass()["toApply"] == {"add": [], "edit": [], "delete": []}
+    assert len(rows(session)) == 1 and rows(session)[0].deleted_at is not None
+
+
+def test_move_of_a_merged_highlight_keeps_its_kobo_id(readest, session):
+    # The Readest note is older than the Kobo's copy of the passage, so the merge
+    # applies no content; it must still record Readest's identity datetime.
+    nid = readest.highlight(xp(3, 1), xp(3, 20), "Merged passage")
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "Merged passage",
+                   at=datetime.now(timezone.utc))
+    readest.run_pass()
+    [row] = rows(session)
+    assert row.readest_key == readest.key_of(readest.notes[nid])
+    assert row.readest_datetime == readest.identity_of(readest.notes[nid])
+    readest.run_pass()
+    readest.clock = int(time.time() * 1000) + 3600 * 1000      # Readest's later move wins
+    readest.edit(nid, xpointer0=xp(3, 6), xpointer1=xp(3, 26))
+    readest.run_pass()
+    live = [r for r in rows(session) if r.deleted_at is None]
+    assert len(rows(session)) == 1 and len(live) == 1
+    assert live[0].kobo_id == "kobo-1" and live[0].xp0 == xp(3, 6) and live[0].kobo_start_path is None

@@ -470,8 +470,6 @@ class TestApplyImport:
         patched = session.query(Highlight).filter_by(user_id=USER).one()
         imported = session.query(Highlight).filter_by(user_id=OTHER_USER).one()
         for name in CONTENT_FIELDS:
-            if name == "readest_datetime":
-                continue
             assert getattr(imported, name) == getattr(patched, name), name
         assert imported.kobo_id == patched.kobo_id == BM1
         assert imported.xp0 is not None

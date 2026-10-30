@@ -52,7 +52,7 @@ EXPECTED = {
         "kobo_id", "kobo_chapter", "kobo_start_path", "kobo_start_char",
         "kobo_end_path", "kobo_end_char", "kobo_chapter_progress",
         "xp0", "xp1", "readest_key", "readest_datetime",
-        "readest_version", "readest_failed_version", "version", "readwise_id", "readwise_dirty",
+        "readest_version", "readest_failed_version", "readest_seen", "readest_held", "version", "readwise_id", "readwise_dirty",
     },
     "highlight_book_state": {
         "id", "user_id", "book_id", "kobo_etag_version", "kobo_delivered_version",
@@ -200,6 +200,29 @@ class TestUpsert:
         upsert_from_side(session, USER, BOOK, "kobo", "k-1",
                          {"text": "Happy families", "note": "n", "updated_at": T1}, T1)
         assert h.version == 1 and etag(session) == 1
+        assert h.updated_at == T0  # an echo must not outrank a later real edit
+        upsert_from_side(session, USER, BOOK, "kobo", "k-1",
+                         {"text": "Happy families", "note": "edited", "updated_at": T0 + MIN}, T1)
+        assert h.note == "edited" and h.updated_at == T0 + MIN and h.version == 2
+
+    def test_identical_content_does_not_restore_a_deleted_row(self, session):
+        h = upsert_from_side(session, USER, BOOK, "kobo", "k-1", {"text": "x", "updated_at": T0}, T0)
+        delete_from_side(session, USER, BOOK, "kobo", "k-1", T1)
+        upsert_from_side(session, USER, BOOK, "kobo", "k-1", {"text": "x", "updated_at": T2}, T2)
+        assert h.deleted_at == T1 and h.version == 2
+
+    def test_readest_datetime_is_identity_not_content(self, session):
+        h = upsert_from_side(session, USER, BOOK, "readest", "r-1",
+                             {"text": "x", "readest_datetime": "2026-10-30 12:00:00", "updated_at": T1}, T1)
+        assert h.readest_datetime == "2026-10-30 12:00:00" and h.version == 1
+        # recorded even by a stale report, and never a version bump
+        upsert_from_side(session, USER, BOOK, "readest", "r-1",
+                         {"text": "x", "readest_datetime": "2026-10-30 12:00:01", "updated_at": T0}, T2)
+        assert h.readest_datetime == "2026-10-30 12:00:01" and h.version == 1
+        # the Kobo side can't set it
+        k = upsert_from_side(session, USER, BOOK, "kobo", "k-1",
+                             {"text": "y", "readest_datetime": "2026-10-30 13:00:00"}, T0)
+        assert k.readest_datetime is None
 
     def test_create_defaults_timestamps_to_now(self, session):
         h = upsert_from_side(session, USER, BOOK, "readest", "r-key", {"text": "x"}, T1)
@@ -243,6 +266,15 @@ class TestMerge:
                              {"text": "happy families", "xp0": P0B, "xp1": P1B, "updated_at": T0}, T1)
         assert a.id == b.id and b.kobo_id == "k-1" and b.readest_key == "r-key"
         assert session.query(Highlight).count() == 1
+
+    def test_merge_attaches_readest_datetime_even_when_the_edit_is_stale(self, session):
+        a = upsert_from_side(session, USER, BOOK, "kobo", "k-1",
+                             {"text": "Happy families", "xp0": P0, "xp1": P1, "updated_at": T1}, T1)
+        upsert_from_side(session, USER, BOOK, "readest", "r-key",
+                         {"text": "Happy families", "xp0": P0B, "xp1": P1B, "updated_at": T0,
+                          "readest_datetime": "2026-10-30 11:00:00"}, T2)
+        assert a.readest_key == "r-key" and a.readest_datetime == "2026-10-30 11:00:00"
+        assert a.xp0 == P0 and a.version == 1
 
     def test_merge_applies_a_newer_edit(self, session):
         a = upsert_from_side(session, USER, BOOK, "kobo", "k-1",

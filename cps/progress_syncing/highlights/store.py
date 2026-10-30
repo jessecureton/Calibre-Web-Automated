@@ -36,8 +36,11 @@ CONTENT_FIELDS = (
     "text", "note", "color",
     "kobo_chapter", "kobo_start_path", "kobo_start_char",
     "kobo_end_path", "kobo_end_char", "kobo_chapter_progress",
-    "xp0", "xp1", "readest_datetime",
+    "xp0", "xp1",
 )
+# Identity a side may pass along with its id: recorded on the row whenever that
+# side's id is (create, merge, or found by it), never counted as a content change.
+SIDE_IDENTITY_FIELDS = {"readest": ("readest_datetime",)}
 
 
 class Highlight(AppBase):
@@ -50,6 +53,11 @@ class Highlight(AppBase):
         xp0, xp1: start and end XPointers into the EPUB
         readest_key, readest_datetime: Readest's identity for the highlight; the key is
             unique per user
+        readest_seen: Readest has listed `readest_key` since CWA recorded it (in a
+            complete key list, or as one of its changes); only such keys can be
+            deleted by their absence
+        readest_held: a Readest deletion of this highlight is held (mass deletion)
+            until its key reappears or an admin releases it
         readest_version: the highest `version` Readest is known to hold (it sent it,
             or acked it)
         readest_failed_version: the `version` Readest last reported it could not apply;
@@ -88,6 +96,8 @@ class Highlight(AppBase):
     readest_datetime = Column(String)
     readest_version = Column(Integer)
     readest_failed_version = Column(Integer)
+    readest_seen = Column(Boolean, nullable=False, default=False, server_default='0')
+    readest_held = Column(Boolean, nullable=False, default=False, server_default='0')
     version = Column(Integer, nullable=False, default=1, server_default='1')
     readwise_id = Column(String)
     readwise_dirty = Column(Boolean, nullable=False, default=False, server_default='0')
@@ -162,6 +172,7 @@ _HIGHLIGHT_COLUMNS = (
     "kobo_end_path TEXT", "kobo_end_char INTEGER", "kobo_chapter_progress REAL",
     "xp0 TEXT", "xp1 TEXT", "readest_key TEXT", "readest_datetime TEXT",
     "readest_version INTEGER", "readest_failed_version INTEGER",
+    "readest_seen BOOLEAN NOT NULL DEFAULT 0", "readest_held BOOLEAN NOT NULL DEFAULT 0",
     "version INTEGER NOT NULL DEFAULT 1",
     "readwise_id TEXT", "readwise_dirty BOOLEAN NOT NULL DEFAULT 0",
 )
@@ -304,14 +315,21 @@ def upsert_from_side(session, user_id: int, book_id: int, side: str, side_id: st
       3. otherwise a new row, with origin set to `side`.
 
     An edit to an existing row applies only if `updated_at` is strictly newer than
-    the row's. A change in content bumps `version` and the book's
-    `kobo_etag_version` and marks the row `readwise_dirty`; a newer timestamp over
-    identical content only moves `updated_at`, so echoes do not cause redelivery.
-    A newer edit to a deleted row restores it. Creates always count as a change.
+    the row's and its content differs. It bumps `version` and the book's
+    `kobo_etag_version` and marks the row `readwise_dirty`. Identical content
+    changes nothing, not even `updated_at`, whatever its timestamp: an echo of
+    what CWA delivered carries the receiver's apply time, and must not outrank a
+    real edit made meanwhile. A newer, different edit to a deleted row restores
+    it; identical content does not. Creates always count as a change.
+
+    The side's identity fields (SIDE_IDENTITY_FIELDS, e.g. Readest's
+    `readest_datetime`) are recorded whenever the row is matched, merged or
+    created, regardless of timestamps, and never count as content.
     """
     column = _side_column(side)
     updated_at = _utc(fields.get("updated_at") or now)
     content = {name: fields[name] for name in CONTENT_FIELDS if name in fields}
+    identity = {name: fields[name] for name in SIDE_IDENTITY_FIELDS.get(side, ()) if name in fields}
 
     row = _find_by_side_id(session, user_id, side, side_id)
     if row is None:
@@ -322,21 +340,20 @@ def upsert_from_side(session, user_id: int, book_id: int, side: str, side_id: st
         row = Highlight(
             user_id=user_id, book_id=book_id, origin=side,
             created_at=_utc(fields.get("created_at") or now), updated_at=updated_at,
-            version=1, readwise_dirty=True, **{column: side_id}, **content)
+            version=1, readwise_dirty=True, **{column: side_id}, **content, **identity)
         session.add(row)
         _bump_book(session, user_id, book_id)
         session.flush()
         return row
 
+    for name, value in identity.items():
+        setattr(row, name, value)
     if row.updated_at is None or updated_at > _utc(row.updated_at):
-        differs = any(getattr(row, name) != value for name, value in content.items())
-        restored = row.deleted_at is not None
-        for name, value in content.items():
-            setattr(row, name, value)
-        row.updated_at = updated_at
-        if restored:
+        if any(getattr(row, name) != value for name, value in content.items()):
+            for name, value in content.items():
+                setattr(row, name, value)
+            row.updated_at = updated_at
             row.deleted_at = None
-        if differs or restored:
             _changed(session, row)
     session.flush()
     return row
