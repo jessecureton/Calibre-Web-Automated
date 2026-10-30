@@ -270,9 +270,17 @@ def _readest_color(ko_color) -> Optional[str]:
     return KO_TO_READEST_COLOR.get(ko_color) if isinstance(ko_color, str) else None
 
 
-def _ko_color(readest_color: Optional[str]) -> str:
-    # "" rather than a default, so Readest's echo of it doesn't invent a colour.
-    return READEST_TO_KO_COLOR.get(readest_color or "", "")
+# What a highlight without a colour (the Kobo's, with colour off) is sent as: Readest
+# shows a note without one in red. Its echo is taken as no colour (see _apply_change).
+DEFAULT_KO_COLOR = "yellow"
+
+
+def _ko_color(readest_color: Optional[str], default: str = "") -> str:
+    # "" for no colour or one KOReader has no name for: an edit then leaves the
+    # note's own colour in Readest (a custom one Readest never sent, say).
+    if not readest_color:
+        return default
+    return READEST_TO_KO_COLOR.get(readest_color, "")
 
 
 def _moved_row(session, user_id: int, book_id: int, datetime_: str, keys: set) -> Optional[Highlight]:
@@ -358,6 +366,8 @@ def _apply_change(session, user_id: int, book_id: int, ann, keys: set, complete:
         # the Kobo's range, for a merged highlight), so they are not taken, and the
         # Kobo's range stays.
         del fields["xp0"], fields["xp1"]
+    if row is not None and row.color is None and fields["color"] == KO_TO_READEST_COLOR[DEFAULT_KO_COLOR]:
+        fields["color"] = None  # the yellow CWA sends for "no colour", echoed back
     row = upsert_from_side(session, user_id, book_id, "readest", key, fields, now)
     row.readest_seen, row.readest_held = True, False
     if row.deleted_at is None and all(getattr(row, name) == value for name, value in fields.items()
@@ -472,7 +482,7 @@ def _add_entry(row: Highlight, datetime_: str) -> dict:
     return {
         "serverId": row.id, "version": row.version,
         "datetime": datetime_, "datetimeUpdated": _ko_datetime(row.updated_at),
-        "drawer": "lighten", "color": _ko_color(row.color),
+        "drawer": "lighten", "color": _ko_color(row.color, DEFAULT_KO_COLOR),
         "text": row.text or "", "note": row.note or None, "chapter": None,
         "posFormat": "xpointer", "pos0": row.xp0, "pos1": row.xp1 or None, "pageno": None,
     }

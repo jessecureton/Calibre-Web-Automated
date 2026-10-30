@@ -976,3 +976,44 @@ def test_readest_echo_with_another_pos1_on_a_key_match_keeps_the_kobo_range(read
     readest.run_pass()
     [row] = rows(session)
     assert row.xp1 == xp(3, 20) and row.kobo_start_path == "span#kobo\\.2\\.1" and row.kobo_id == "kobo-1"
+
+
+def test_colourless_kobo_highlight_is_offered_yellow(readest, session):
+    """Readest shows a note without a colour in red; the Kobo's highlights are yellow."""
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "From the Kobo")
+    result = readest.run_pass()
+    [add] = result["toApply"]["add"]
+    assert add["color"] == "yellow"
+    [note] = readest.notes.values()
+    assert note["color"] == "yellow"
+    [row] = rows(session)
+    assert row.color is None
+
+
+def test_yellow_echo_of_a_colourless_highlight_changes_nothing(client, session, readest):
+    kobo_highlight(session, "kobo-1", xp(3, 0), xp(3, 20), "From the Kobo")
+    readest.run_pass()
+    [row] = rows(session)
+    version = row.version
+    later = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    change = {**_change(row.readest_datetime, xp(3, 0), xp(3, 20), "From the Kobo"),
+              "color": "yellow", "datetimeUpdated": later}
+    r = exchange(client, [{"hash": HASH, "keys": [{"k": row.readest_key, "dt": row.readest_datetime}],
+                           "keysComplete": True, "changes": [change]}])
+    assert r["results"][0]["toApply"] == {"add": [], "edit": [], "delete": []}
+    [row] = rows(session)
+    assert row.version == version and row.color is None
+
+
+def test_edit_of_a_colourless_highlight_leaves_readests_own_colour(readest, session):
+    nid = readest.highlight(xp(2, 0), xp(2, 14), "A first passage", color="#123456")  # no KOReader name
+    readest.run_pass()
+    [row] = rows(session)
+    assert row.color is None
+    upsert_from_side(session, USER, BOOK, "readest", row.readest_key,
+                     {"note": "from the Kobo", "updated_at": datetime.now(timezone.utc) + timedelta(hours=1)},
+                     datetime.now(timezone.utc))
+    session.commit()
+    [edit] = readest.run_pass()["toApply"]["edit"]
+    assert edit["color"] == ""
+    assert readest.notes[nid]["color"] == "#123456" and readest.notes[nid]["note"] == "from the Kobo"
