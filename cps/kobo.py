@@ -39,6 +39,7 @@ import requests
 
 from . import config, logger, kobo_auth, db, calibre_db, helper, shelf as shelf_lib, ub, csrf, kobo_sync_status, magic_shelf
 from . import isoLanguages
+from . import readingservices
 from .epub import get_epub_layout
 from .constants import COVER_THUMBNAIL_SMALL, COVER_THUMBNAIL_MEDIUM, COVER_THUMBNAIL_LARGE, DEFAULT_PORT
 from .kobo_cover_cache import build_cover_image_id, normalize_cover_uuid
@@ -48,6 +49,7 @@ from .web import download_required
 from .kobo_auth import requires_kobo_auth, get_auth_token
 from .progress_syncing.position_bridge import run_bridge
 from .progress_syncing.position_bridge.service import on_kobo_state
+from .progress_syncing.highlights import kobo_side
 
 KOBO_FORMATS = {"KEPUB": ["KEPUB"], "EPUB": ["EPUB3", "EPUB"]}
 KOBO_STOREAPI_URL = "https://storeapi.kobo.com"
@@ -1382,15 +1384,40 @@ def _kobo_reading_services_stub():
     # commits. Return benign empty responses so the sync completes. Only the Kobo
     # reading-services paths are matched; every other request falls through.
     p = request.path
-    if p == "/api/v3/content/checkforchanges":
-        return make_response(jsonify([]))
-    if p.startswith("/api/v3/content/") and p.endswith("/annotations"):
-        return make_response(jsonify({"data": [], "totalResults": 0}))
-    if p.startswith("/api/UserStorage/"):
-        return make_response(jsonify({}))
-    if p.startswith("/api/internal/notebooks"):
-        return make_response(jsonify({"data": [], "totalResults": 0}))
-    return None
+    stub = readingservices.reading_services_stub_response(p)
+    if stub is None:
+        return None
+    if kobo_side.highlight_routing_active():
+        # Highlight sync (on, or ever on) points reading_services_host at CWA for
+        # every Kobo: its readingservices views answer checkforchanges and the
+        # annotation GET/PATCH, and the rest of the device's reading-services
+        # traffic (UserStorage, stylus notebooks) goes on to Kobo as it did before.
+        if readingservices.highlight_route(request.method, p):
+            return None
+        if config.config_kobo_proxy and (p.startswith("/api/UserStorage/")
+                                         or p.startswith("/api/internal/notebooks")):
+            return readingservices.proxy_to_kobo_reading_services()
+    return stub
+
+
+def _highlight_sync_init():
+    """Whether highlight sync is on or was ever on; if so, record the Kobo's firmware."""
+    try:
+        if not kobo_side.highlight_routing_active():
+            return False
+    except Exception as e:
+        log.warning(f"[highlight-sync] could not read the highlight sync setting: {e}")
+        return False
+    try:
+        kobo_side.record_kobo_firmware(ub.session, current_user.id, request.headers.get("User-Agent"))
+        ub.session.commit()
+    except Exception as e:
+        log.warning(f"[highlight-sync] could not record Kobo firmware: {type(e).__name__}")
+        try:
+            ub.session.rollback()
+        except Exception:
+            pass
+    return True
 
 
 @kobo.route("/v1/initialization")
@@ -1428,6 +1455,9 @@ def HandleInitRequest():
         log.debug("Using fallback Kobo resource definitions")
         kobo_resources = NATIVE_KOBO_RESOURCES()
 
+    # Highlight sync, once ever on, keeps the Kobo's annotation calls on CWA.
+    highlight_sync_active = _highlight_sync_init()
+
     if not current_app.wsgi_app.is_proxied:
         log.debug('Kobo: Received unproxied request, changed request port to external server port')
         if ':' in request.host and not request.host.endswith(']'):
@@ -1456,7 +1486,7 @@ def HandleInitRequest():
                                                                width="{width}",
                                                                height="{height}",
                                                                isGreyscale='false'))
-        if config.config_hardcover_annotations_sync and bool(hardcover):
+        if (config.config_hardcover_annotations_sync and bool(hardcover)) or highlight_sync_active:
             kobo_resources["reading_services_host"] = calibre_web_url
     else:
         kobo_resources["image_host"] = url_for("web.index", _external=True).strip("/")
@@ -1475,7 +1505,7 @@ def HandleInitRequest():
                                                                height="{height}",
                                                                isGreyscale='false',
                                                                _external=True))
-        if config.config_hardcover_annotations_sync and bool(hardcover):
+        if (config.config_hardcover_annotations_sync and bool(hardcover)) or highlight_sync_active:
             kobo_resources["reading_services_host"] = url_for("web.index", _external=True).strip("/")
 
     # When not proxying Kobo Store requests, point oauth_host to CWA and
