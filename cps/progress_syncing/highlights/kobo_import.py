@@ -139,9 +139,12 @@ _ROW = """
            b.EndContainerPath, b.EndOffset, b.Text, b.Annotation, b.DateCreated, b.DateModified,
            b.ChapterProgress, {title}, {author}
     FROM Bookmark b {join}
-    WHERE b.Type = 'highlight' AND COALESCE(b.Hidden, 0) = 0 AND TRIM(COALESCE(b.Text, '')) <> ''
+    WHERE b.Type = 'highlight' AND {visible} AND TRIM(COALESCE(b.Text, '')) <> ''
     ORDER BY b.DateCreated, b.BookmarkID
 """
+# Nickel stores Hidden as the text 'false'/'true'; older or hand-made copies use 0/1.
+_VISIBLE = "LOWER(CAST(COALESCE(b.Hidden, 0) AS TEXT)) NOT IN ('1', 'true')"
+
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -171,10 +174,10 @@ def read_kobo_highlights(db_path: str) -> list:
         if "Bookmark" not in tables:
             raise KoboDatabaseError("no Bookmark table")
         if "content" in tables:
-            sql = _ROW.format(title="c.Title", author="c.Attribution",
+            sql = _ROW.format(title="c.Title", author="c.Attribution", visible=_VISIBLE,
                               join="LEFT JOIN content c ON c.ContentID = b.VolumeID AND c.ContentType = '6'")
         else:
-            sql = _ROW.format(title="NULL", author="NULL", join="")
+            sql = _ROW.format(title="NULL", author="NULL", join="", visible=_VISIBLE)
         try:
             fetched = con.execute(sql).fetchall()
         except sqlite3.DatabaseError as e:

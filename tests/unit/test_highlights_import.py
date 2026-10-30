@@ -161,6 +161,17 @@ class TestReadKoboHighlights:
             bookmark(BM1), bookmark(BM2, kind="dogear"), bookmark(BM3, hidden=1)])
         assert [r["bookmark_id"] for r in read_kobo_highlights(path)] == [BM1]
 
+    def test_hidden_stored_as_text_like_nickel_does(self, tmp_path):
+        """Nickel writes Hidden as the text 'false'/'true', not 0/1."""
+        path = make_kobo_db(tmp_path / "k.sqlite", [
+            bookmark(BM1, hidden="false"), bookmark(BM2, hidden="true"), bookmark(BM3, hidden="TRUE"),
+            bookmark(OLD1, hidden="0"), bookmark(OLD2, hidden="1")])
+        con = sqlite3.connect(path)
+        assert con.execute("SELECT typeof(Hidden) FROM Bookmark WHERE BookmarkID = ?", (BM1,)).fetchone() == \
+            ("text",)
+        con.close()
+        assert sorted(r["bookmark_id"] for r in read_kobo_highlights(path)) == [BM1, OLD1]
+
     def test_notes_are_read_and_empty_ones_are_none(self, tmp_path):
         path = make_kobo_db(tmp_path / "k.sqlite", [
             bookmark(BM1, annotation_text="my note"), bookmark(BM2, annotation_text="")])
