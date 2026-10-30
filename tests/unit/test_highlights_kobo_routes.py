@@ -434,7 +434,15 @@ class TestGet:
         assert r.status_code == 401
 
 
+@pytest.fixture
+def imported(session):
+    """The user's Kobo import is done, so checkforchanges may name books."""
+    session.add(HighlightDevice(user_id=USER, kobo_import_done=True))
+    session.commit()
+
+
 @pytest.mark.unit
+@pytest.mark.usefixtures("imported")
 class TestCheckForChanges:
     def test_checkforchanges_names_book_only_when_etag_differs_and_firmware_tested(self, client, session, monkeypatch):
         client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
@@ -503,6 +511,17 @@ class TestCheckForChanges:
         assert r.get_json() == [UUID]
         client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
         assert rollbacks == []
+
+    def test_nothing_is_named_until_the_users_kobo_import_is_done(self, client, session, monkeypatch):
+        client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        session.query(HighlightDevice).one().kobo_import_done = False
+        session.commit()
+        no_proxy(monkeypatch)
+        batch = [{"ContentId": UUID, "etag": 'W/"0"'}]
+        assert client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS).get_json() == []
+        session.query(HighlightDevice).one().kobo_import_done = True
+        session.commit()
+        assert client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS).get_json() == [UUID]
 
     def test_a_book_whose_patch_failed_is_not_named_until_a_patch_succeeds(self, client, session, monkeypatch):
         """Named after a failed PATCH, the Kobo's GET would delete the highlights that PATCH carried."""

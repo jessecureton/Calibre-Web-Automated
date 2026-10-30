@@ -467,10 +467,25 @@ class TestAnnotationSet:
 
 @pytest.mark.unit
 class TestChangedBooks:
-    def _setup(self, session, files):
+    def _setup(self, session, files, import_done=True):
         apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [annotation()]}, NOW, files=files)
+        session.add(HighlightDevice(user_id=USER, kobo_import_done=import_done))
         session.commit()
         return {UUID_A: BOOK, UUID_B: OTHER_BOOK}.get
+
+    def test_nothing_is_named_until_the_users_kobo_import_is_done(self, session, files, flags):
+        lookup = self._setup(session, files, import_done=False)
+        entries = [{"ContentId": UUID_A, "etag": 'W/"0"'}]
+        assert kobo_changed_books(session, USER, entries, FIRMWARE, book_id_for=lookup) == []
+        session.query(HighlightDevice).one().kobo_import_done = True
+        session.commit()
+        assert kobo_changed_books(session, USER, entries, FIRMWARE, book_id_for=lookup) == [UUID_A]
+
+    def test_nothing_is_named_without_a_device_row(self, session, files, flags):
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [annotation()]}, NOW, files=files)
+        session.commit()
+        entries = [{"ContentId": UUID_A, "etag": 'W/"0"'}]
+        assert kobo_changed_books(session, USER, entries, FIRMWARE, book_id_for={UUID_A: BOOK}.get) == []
 
     def test_names_book_only_when_etag_differs(self, session, files, flags):
         lookup = self._setup(session, files)

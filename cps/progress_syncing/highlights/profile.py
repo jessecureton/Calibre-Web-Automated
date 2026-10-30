@@ -22,7 +22,7 @@ from sqlalchemy import func
 
 from .. import settings
 from ... import ub
-from .store import Highlight, HighlightDevice
+from .store import Highlight, HighlightDevice, mark_kobo_import_done
 
 _TOKEN_PREFIX = re.compile(r"^(?:token|bearer)\s+", re.IGNORECASE)
 
@@ -65,6 +65,7 @@ def admin_summary(session, user_id: int) -> dict:
     return {
         "readest_device_id": device.readest_device_id if device and device.readest_device_id else None,
         "kobo_firmware": device.kobo_firmware if device and device.kobo_firmware else None,
+        "kobo_import_done": bool(device and device.kobo_import_done),
         "held_count": held or 0,
     }
 
@@ -82,3 +83,8 @@ def apply_held_deletions(session, user_id: int) -> int:
     """Apply every Readest deletion held for the user; returns how many highlights were deleted. The caller commits."""
     from .bookorbit import release_held_deletions  # bookorbit -> kosync -> kobo -> web -> profile
     return release_held_deletions(session, user_id)
+
+
+def mark_no_kobo_highlights(session, user_id: int) -> None:
+    """The admin says the user's Kobo holds no highlights to import: open the Kobo gate. The caller commits."""
+    mark_kobo_import_done(session, user_id)

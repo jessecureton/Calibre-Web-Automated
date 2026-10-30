@@ -27,7 +27,7 @@ from cps.progress_syncing.highlights.kobo_import import (
     read_kobo_highlights,
 )
 from cps.progress_syncing.highlights.kobo_side import apply_kobo_patch
-from cps.progress_syncing.highlights.store import CONTENT_FIELDS, Highlight, upsert_from_side
+from cps.progress_syncing.highlights.store import CONTENT_FIELDS, Highlight, HighlightDevice, upsert_from_side
 
 from .position_bridge_books import CH1, CH2, kepubify_like, write_book
 from .test_highlights_kobo_side import CH2_PATH, annotation, ch2_xpointers
@@ -172,6 +172,23 @@ class TestReadKoboHighlights:
         con.close()
         assert sorted(r["bookmark_id"] for r in read_kobo_highlights(path)) == [BM1, OLD1]
 
+    def test_note_typed_rows_are_read_as_highlights(self, tmp_path):
+        path = make_kobo_db(tmp_path / "k.sqlite", [bookmark(BM1, kind="note", annotation_text="a thought")])
+        [row] = read_kobo_highlights(path)
+        assert (row["bookmark_id"], row["note"]) == (BM1, "a thought")
+
+    def test_other_bookmarks_are_counted_not_read(self, tmp_path):
+        path = make_kobo_db(tmp_path / "k.sqlite", [
+            bookmark(BM1), bookmark(BM2, kind="dogear", text=None), bookmark(BM3, kind="dogear", hidden="true"),
+            bookmark(OLD1, kind="markup", text=None),
+            bookmark(OLD2, volume=UUID_STORE, content=f"{UUID_STORE}!x", kind="dogear", text=None)],
+            titles=((UUID_A, TITLE, AUTHOR), (UUID_STORE, "A Store Book", "Sam Store")))
+        others = kobo_import.read_kobo_other_bookmarks(path)
+        assert sorted((o["volume_id"], o["type"]) for o in others) == sorted(
+            [(UUID_A, "dogear"), (UUID_A, "markup"), (UUID_STORE, "dogear")])
+        assert {o["title"] for o in others} == {TITLE, "A Store Book"}
+        assert "text" not in others[0]
+
     def test_notes_are_read_and_empty_ones_are_none(self, tmp_path):
         path = make_kobo_db(tmp_path / "k.sqlite", [
             bookmark(BM1, annotation_text="my note"), bookmark(BM2, annotation_text="")])
@@ -244,8 +261,9 @@ class TestPlanImport:
         summary = p.summary()
         none = {"new": 0, "already_present": 0, "contained_in_existing": 0, "recovered": 0, "unmatched": 0}
         assert summary == [
-            {"title": "A Store Book", **none, "unmatched": 1, "reasons": {kobo_import.REASONS["no_book"]: 1}},
-            {"title": TITLE, **none, "new": 1, "reasons": {}},
+            {"title": "A Store Book", **none, "unmatched": 1, "other_bookmarks": 0,
+             "reasons": {kobo_import.REASONS["no_book"]: 1}},
+            {"title": TITLE, **none, "new": 1, "other_bookmarks": 0, "reasons": {}},
         ]
         assert FIRST not in repr(summary)
         assert p.counts() == {**none, "new": 1, "unmatched": 1}
@@ -487,6 +505,40 @@ class TestApplyImport:
         assert (imported.origin, patched.origin) == ("import", "kobo")
 
 
+class TestImportGate:
+    def device(self, session, user=USER):
+        session.expire_all()
+        return session.query(HighlightDevice).filter_by(user_id=user).first()
+
+    def test_apply_marks_the_users_kobo_import_done(self, session, main_db, cwa):
+        assert self.device(session) is None
+        apply_import(session, USER, plan(session, read_kobo_highlights(main_db), cwa=cwa), NOW)
+        session.commit()
+        assert self.device(session).kobo_import_done is True
+        assert self.device(session, OTHER_USER) is None
+
+    def test_an_import_with_nothing_new_still_marks_it_done(self, session, cwa, tmp_path):
+        session.add(HighlightDevice(user_id=USER, kobo_firmware="4.38.23852"))
+        session.commit()
+        path = make_kobo_db(tmp_path / "k.sqlite", [])
+        assert apply_import(session, USER, plan(session, read_kobo_highlights(path), cwa=cwa), NOW) == 0
+        session.commit()
+        device = self.device(session)
+        assert device.kobo_import_done is True and device.kobo_firmware == "4.38.23852"
+
+    def test_plan_counts_other_bookmarks_per_book(self, session, tmp_path, cwa):
+        path = make_kobo_db(tmp_path / "k.sqlite", [
+            bookmark(BM1), bookmark(BM2, kind="dogear", text=None), bookmark(BM3, kind="dogear", text=None),
+            bookmark(OLD2, volume=UUID_STORE, content=f"{UUID_STORE}!x", kind="dogear", text=None)],
+            titles=((UUID_A, "Kobo's own title", AUTHOR), (UUID_STORE, "A Store Book", "Sam Store")))
+        p = plan_import(session, USER, read_kobo_highlights(path), (),
+                        other_rows=kobo_import.read_kobo_other_bookmarks(path), **cwa)
+        by_title = {b["title"]: b for b in p.summary()}
+        assert by_title[TITLE]["other_bookmarks"] == 2 and by_title[TITLE]["new"] == 1
+        assert by_title["A Store Book"]["other_bookmarks"] == 1 and by_title["A Store Book"]["new"] == 0
+        assert p.other_bookmarks_total() == 3
+
+
 class TestStash:
     @pytest.fixture(autouse=True)
     def stash_root(self, tmp_path, monkeypatch):
@@ -605,6 +657,28 @@ class TestAdminRoute:
         assert os.listdir(kobo_import.STASH_ROOT) == []
         with web.client.session_transaction() as s:
             assert "highlight_import_token" not in s
+
+    def test_upload_counts_other_bookmarks_per_book(self, web, tmp_path):
+        path = make_kobo_db(tmp_path / "k.sqlite", [
+            bookmark(BM1), bookmark(BM2, kind="dogear", text="secret dogear text")])
+        html = upload(web, path).get_data(as_text=True)
+        assert 'id="highlights_import_other"' in html and "secret dogear text" not in html
+        assert '<td class="other-bookmarks">1</td>' in html
+
+    def test_nothing_new_can_still_be_marked_done(self, web, session):
+        upload(web)
+        with web.client.session_transaction() as s:
+            token = s["highlight_import_token"]
+        web.client.post("/admin/highlights/import/apply", data={"token": token})
+        html = upload(web).get_data(as_text=True)       # BM1 is in CWA now: nothing new
+        assert "There is nothing to import." in html and 'name="token"' in html
+        session.query(HighlightDevice).delete()
+        session.commit()
+        with web.client.session_transaction() as s:
+            token = s["highlight_import_token"]
+        web.client.post("/admin/highlights/import/apply", data={"token": token})
+        session.expire_all()
+        assert session.query(HighlightDevice).filter_by(user_id=USER).one().kobo_import_done is True
 
     def test_apply_with_another_token_does_nothing(self, web, session):
         upload(web)

@@ -2007,6 +2007,27 @@ def highlight_apply_held_deletions(user_id):
     return redirect(url_for("admin.edit_user", user_id=user.id))
 
 
+@admi.route("/admin/user/<int:user_id>/highlight-sync/no-kobo-import", methods=["POST"])
+@user_login_required
+@admin_required
+def highlight_no_kobo_import(user_id):
+    """Say the user's Kobo has no highlights to import, so CWA may start delivering to it."""
+    user = _highlight_user_or_404(user_id)
+    try:
+        highlight_profile.mark_no_kobo_highlights(ub.session, user.id)
+        ub.session.commit()
+    except Exception:
+        ub.session.rollback()
+        log.exception("[highlight-sync] marking the Kobo import done failed")
+        flash(_("Could not record that. See the log for details."), category="error")
+        return redirect(url_for("admin.edit_user", user_id=user.id))
+    log.info("[highlight-sync] user=%s: Kobo import marked done (no highlights) by admin %s",
+             user.id, current_user.id)
+    flash(_("Recorded that %(name)s has no Kobo highlights to import. Highlights now sync to their Kobo.",
+            name=user.name), category="success")
+    return redirect(url_for("admin.edit_user", user_id=user.id))
+
+
 @admi.route("/admin/resetpassword/<int:user_id>", methods=["POST"])
 @user_login_required
 @admin_required
@@ -3217,7 +3238,8 @@ def highlights_import():
         stash = kobo_import.load_stash(token)
         rows = kobo_import.read_kobo_highlights(stash.main_path)
         older_rows = kobo_import.read_kobo_highlights(stash.older_path) if stash.older_path else []
-        plan = kobo_import.plan_import(ub.session, target.id, rows, older_rows)
+        other_rows = kobo_import.read_kobo_other_bookmarks(stash.main_path)
+        plan = kobo_import.plan_import(ub.session, target.id, rows, older_rows, other_rows=other_rows)
     except kobo_import.KoboDatabaseError as e:
         kobo_import.discard_stash(token)
         log.warning("[highlight-sync] import upload refused: %s", e)

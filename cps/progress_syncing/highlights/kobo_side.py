@@ -38,6 +38,7 @@ from .store import (
     _find_merge_candidate,
     _utc,
     delete_from_side,
+    kobo_import_done,
     live_for_book,
     upsert_from_side,
 )
@@ -500,11 +501,15 @@ def kobo_changed_books(session, user_id: int, entries: list, firmware: Optional[
 
     A CWA book is named when its `kobo_etag_version` is above 0 and the ETag the
     device sent differs from `W/"cwa-<kobo_etag_version>"`. Nothing is named unless highlight sync is on and
-    the firmware is one the admin verified. A book whose last PATCH failed
+    the firmware is one the admin verified, and nothing until the user's Kobo import
+    is done (`HighlightDevice.kobo_import_done`). A book whose last PATCH failed
     (`record_patch_result`) is not named until a PATCH for it succeeds.
     `book_id_for` maps a ContentId to a CWA book id, or None for a book CWA doesn't own.
     """
     if not delivers_to(firmware):
+        return []
+    if not kobo_import_done(session, user_id):
+        # The device may hold highlights CWA has never seen; a GET would delete them.
         return []
     # A book CWA never held anything for (version 0) has nothing to send: the
     # device's own W/"0" is as good as ours.

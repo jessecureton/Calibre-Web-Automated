@@ -42,7 +42,8 @@ from ... import logger
 from ..position_bridge.service import library_files
 from .kobo_side import _KOBO_FIELDS, _Books, _has_range, _parse_kobo_time, fields_from_entry
 from .ranges import count_text_occurrences, locate_text_range
-from .store import Highlight, upsert_from_side
+from .kobo_side import ANNOTATION_TYPES
+from .store import Highlight, mark_kobo_import_done, upsert_from_side
 
 log = logger.create()
 
@@ -92,17 +93,27 @@ class ImportPlan:
     contained_in_existing: list = field(default_factory=list)  # older copy's text inside an existing highlight's
     recovered: list = field(default_factory=list)
     unmatched: list = field(default_factory=list)
+    other_bookmarks: dict = field(default_factory=dict)  # book title -> rows of another type, not imported
 
     def counts(self) -> dict:
         return {name: len(getattr(self, name)) for name in BUCKETS}
 
+    def other_bookmarks_total(self) -> int:
+        return sum(self.other_bookmarks.values())
+
     def summary(self) -> list:
         """Per-book counts, by title, with a count per reason for the unmatched: never any highlight text."""
         books: dict = {}
+
+        def entry_for(title):
+            return books.setdefault(title, {**dict.fromkeys(BUCKETS, 0), "other_bookmarks": 0, "reasons": {}})
+
+        for title, count in self.other_bookmarks.items():
+            entry_for(title)["other_bookmarks"] = count
         for bucket in BUCKETS:
             for item in getattr(self, bucket):
                 title = item.title or item.row.get("title") or "(unknown book)"
-                entry = books.setdefault(title, {**dict.fromkeys(BUCKETS, 0), "reasons": {}})
+                entry = entry_for(title)
                 entry[bucket] += 1
                 if bucket == "unmatched" and item.reason:
                     entry["reasons"][item.reason] = entry["reasons"].get(item.reason, 0) + 1
@@ -139,12 +150,22 @@ _ROW = """
            b.EndContainerPath, b.EndOffset, b.Text, b.Annotation, b.DateCreated, b.DateModified,
            b.ChapterProgress, {title}, {author}
     FROM Bookmark b {join}
-    WHERE b.Type = 'highlight' AND {visible} AND TRIM(COALESCE(b.Text, '')) <> ''
+    WHERE b.Type IN {types} AND {visible} AND TRIM(COALESCE(b.Text, '')) <> ''
     ORDER BY b.DateCreated, b.BookmarkID
 """
+# Rows of any other type (a dogear, i.e. a bookmark, say): counted for the dry run, never read.
+_OTHER = """
+    SELECT b.BookmarkID, b.VolumeID, COALESCE(b.Type, ''), {title}
+    FROM Bookmark b {join}
+    WHERE COALESCE(b.Type, '') NOT IN {types} AND {visible}
+"""
+_TYPES = "(" + ", ".join(f"'{t}'" for t in ANNOTATION_TYPES) + ")"
 # Nickel stores Hidden as the text 'false'/'true'; older or hand-made copies use 0/1.
 _VISIBLE = "LOWER(CAST(COALESCE(b.Hidden, 0) AS TEXT)) NOT IN ('1', 'true')"
 
+
+
+_CONTENT_JOIN = "LEFT JOIN content c ON c.ContentID = b.VolumeID AND c.ContentType = '6'"
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -162,7 +183,7 @@ def read_kobo_highlights(db_path: str) -> list:
     """
     The highlights in a KoboReader.sqlite, oldest first, each joined to its book's title and author.
 
-    Only `Type='highlight'` rows with text, and not hidden. Raises
+    Only highlight and note rows (`Type` 'highlight' or 'note') with text, and not hidden. Raises
     KoboDatabaseError if the file isn't a Kobo database. The file is opened read-only.
     """
     try:
@@ -174,10 +195,10 @@ def read_kobo_highlights(db_path: str) -> list:
         if "Bookmark" not in tables:
             raise KoboDatabaseError("no Bookmark table")
         if "content" in tables:
-            sql = _ROW.format(title="c.Title", author="c.Attribution", visible=_VISIBLE,
-                              join="LEFT JOIN content c ON c.ContentID = b.VolumeID AND c.ContentType = '6'")
+            sql = _ROW.format(title="c.Title", author="c.Attribution", visible=_VISIBLE, types=_TYPES,
+                              join=_CONTENT_JOIN)
         else:
-            sql = _ROW.format(title="NULL", author="NULL", join="", visible=_VISIBLE)
+            sql = _ROW.format(title="NULL", author="NULL", join="", visible=_VISIBLE, types=_TYPES)
         try:
             fetched = con.execute(sql).fetchall()
         except sqlite3.DatabaseError as e:
@@ -200,6 +221,41 @@ def read_kobo_highlights(db_path: str) -> list:
             "created": _parse_kobo_time(created), "modified": _parse_kobo_time(modified),
             "chapter_progress": progress, "title": title, "author": author,
         })
+    return rows
+
+
+def read_kobo_other_bookmarks(db_path: str) -> list:
+    """
+    The database's visible rows of any other type (dogears, i.e. bookmarks, and the
+    like), which the import leaves out: `{"volume_id", "type", "title"}` each, never
+    their text. Raises KoboDatabaseError if the file isn't a Kobo database.
+    """
+    try:
+        con = _connect(db_path)
+    except sqlite3.DatabaseError as e:
+        raise KoboDatabaseError("not a SQLite database") from e
+    try:
+        tables = {name for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "Bookmark" not in tables:
+            raise KoboDatabaseError("no Bookmark table")
+        if "content" in tables:
+            sql = _OTHER.format(title="c.Title", join=_CONTENT_JOIN, types=_TYPES, visible=_VISIBLE)
+        else:
+            sql = _OTHER.format(title="NULL", join="", types=_TYPES, visible=_VISIBLE)
+        try:
+            fetched = con.execute(sql).fetchall()
+        except sqlite3.DatabaseError as e:
+            raise KoboDatabaseError(f"unreadable Bookmark table ({type(e).__name__})") from e
+    except sqlite3.DatabaseError as e:
+        raise KoboDatabaseError("not a SQLite database") from e
+    finally:
+        con.close()
+    rows, seen = [], set()
+    for bookmark_id, volume, kind, title in fetched:
+        if bookmark_id in seen:
+            continue
+        seen.add(bookmark_id)
+        rows.append({"volume_id": volume, "type": kind, "title": title})
     return rows
 
 
@@ -306,7 +362,7 @@ def _is_span_path(path) -> bool:
 
 def plan_import(session, user_id: int, rows, older_rows=(), *,
                 find_book: Optional[Callable] = None, catalog: Optional[Callable] = None,
-                files: Optional[Callable] = None) -> ImportPlan:
+                files: Optional[Callable] = None, other_rows=()) -> ImportPlan:
     """
     Sort Kobo highlights into an ImportPlan for a user, writing nothing.
 
@@ -324,6 +380,8 @@ def plan_import(session, user_id: int, rows, older_rows=(), *,
     and the text is in it, else anywhere in the book. It is `recovered` only if
     the text occurs exactly once there; a repeated passage is `unmatched`
     (`ambiguous_text`), never guessed between its copies.
+
+    `other_rows` (from `read_kobo_other_bookmarks`) are only counted, per book.
 
     `find_book`, `catalog` and `files` default to the library's lookups.
     """
@@ -375,6 +433,14 @@ def plan_import(session, user_id: int, rows, older_rows=(), *,
         fields = _stamp(fields_from_entry(books_for(book.id), entry), row)
         main_texts.setdefault(book.id, []).append(_words(row["text"]))
         plan.new.append(PlanItem(row, book.id, book.title, fields))
+
+    for row in other_rows:
+        volume = row["volume_id"]
+        if volume not in volumes:
+            volumes[volume] = find_book(volume)
+        book = volumes[volume]
+        title = (book.title if book else row.get("title")) or "(unknown book)"
+        plan.other_bookmarks[title] = plan.other_bookmarks.get(title, 0) + 1
 
     older_rows = list(older_rows)
     if older_rows:
@@ -434,7 +500,9 @@ def apply_import(session, user_id: int, plan: ImportPlan, now) -> int:
     is skipped, whatever the plan says, so a stale plan or a second run adds
     nothing and never overwrites an edit or a delete. A highlight CWA already
     holds under another id (the same passage from Readest) is linked to, as
-    with a Kobo PATCH, keeping its content. Flushes; the caller commits.
+    with a Kobo PATCH, keeping its content. Marks the user's Kobo import done
+    (`HighlightDevice.kobo_import_done`), so checkforchanges may name books from
+    now on, even when nothing was new. Flushes; the caller commits.
     """
     stored = 0
     for item in [*plan.new, *plan.recovered]:
@@ -449,6 +517,7 @@ def apply_import(session, user_id: int, plan: ImportPlan, now) -> int:
                 setattr(row, name, item.fields.get(name))
             session.flush()
         stored += 1
+    mark_kobo_import_done(session, user_id)
     if stored:
         log.info(f"[highlight-sync] user={user_id}: imported {stored} highlights from a Kobo database")
     return stored

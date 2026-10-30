@@ -59,7 +59,7 @@ EXPECTED = {
         "id", "user_id", "book_id", "kobo_etag_version", "kobo_delivered_version",
         "readwise_backfill_done",
     },
-    "highlight_device": {"id", "user_id", "kobo_firmware", "readest_device_id"},
+    "highlight_device": {"id", "user_id", "kobo_firmware", "readest_device_id", "kobo_import_done"},
     "kobo_opaque_annotation": {"id", "user_id", "book_id", "kobo_id", "raw", "updated_at", "deleted_at"},
 }
 
@@ -127,6 +127,17 @@ class TestTables:
         assert _columns(conn, "highlight") == EXPECTED["highlight"]
         row = conn.execute("SELECT text, version, readwise_dirty FROM highlight").fetchone()
         assert row == ("kept", 1, 0)
+
+    def test_adds_kobo_import_done_to_an_older_device_table(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE user (id INTEGER PRIMARY KEY)")
+        conn.execute("""CREATE TABLE highlight_device (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL UNIQUE, kobo_firmware TEXT, readest_device_id TEXT)""")
+        conn.execute("INSERT INTO highlight_device (user_id, kobo_firmware) VALUES (3, '4.38.23852')")
+        ensure_highlight_tables(conn)
+        ensure_highlight_tables(conn)
+        assert conn.execute("SELECT kobo_firmware, kobo_import_done FROM highlight_device").fetchone() == \
+            ("4.38.23852", 0)
 
     def test_user_delete_cascades(self):
         conn = sqlite3.connect(":memory:")

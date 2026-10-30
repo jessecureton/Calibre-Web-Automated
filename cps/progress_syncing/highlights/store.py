@@ -137,6 +137,9 @@ class HighlightDevice(AppBase):
     Fields:
         kobo_firmware: firmware version the user's Kobo last reported
         readest_device_id: the Readest device id last seen for the user
+        kobo_import_done: the highlights already on the user's Kobo have been imported
+            (or an admin said there are none); until then checkforchanges names no
+            book, since a GET would delete the device's highlights CWA doesn't hold
     """
     __tablename__ = 'highlight_device'
 
@@ -144,6 +147,7 @@ class HighlightDevice(AppBase):
     user_id = Column(Integer, ForeignKey('user.id', ondelete='CASCADE'), nullable=False, unique=True)
     kobo_firmware = Column(String)
     readest_device_id = Column(String)
+    kobo_import_done = Column(Boolean, nullable=False, default=False, server_default='0')
 
 
 class KoboOpaqueAnnotation(AppBase):
@@ -192,7 +196,7 @@ _BOOK_STATE_COLUMNS = (
     "kobo_delivered_version INTEGER NOT NULL DEFAULT 0",
     "readwise_backfill_done BOOLEAN NOT NULL DEFAULT 0",
 )
-_DEVICE_COLUMNS = ("kobo_firmware TEXT", "readest_device_id TEXT")
+_DEVICE_COLUMNS = ("kobo_firmware TEXT", "readest_device_id TEXT", "kobo_import_done BOOLEAN NOT NULL DEFAULT 0")
 _OPAQUE_COLUMNS = ("raw TEXT NOT NULL DEFAULT '{}'", "updated_at TIMESTAMP", "deleted_at TIMESTAMP")
 
 
@@ -241,6 +245,21 @@ def ensure_highlight_tables(conn):
         conn.commit()
     except Exception as e:
         log.error(f"Could not create the unique Readest key index: {e}")
+
+
+def mark_kobo_import_done(session, user_id: int) -> None:
+    """Record that the user's Kobo highlights are in CWA (or that there are none). Flushes."""
+    device = session.query(HighlightDevice).filter_by(user_id=user_id).first()
+    if device is None:
+        session.add(HighlightDevice(user_id=user_id, kobo_import_done=True))
+    else:
+        device.kobo_import_done = True
+    session.flush()
+
+
+def kobo_import_done(session, user_id: int) -> bool:
+    device = session.query(HighlightDevice).filter_by(user_id=user_id).first()
+    return bool(device and device.kobo_import_done)
 
 
 def _utc(value: datetime) -> datetime:

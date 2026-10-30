@@ -314,6 +314,50 @@ class TestAdminSection:
         assert world.client.post("/admin/user/99/highlight-sync/apply-held").status_code == 404
 
 
+class TestKoboImportGate:
+    PATH = f"/admin/user/{USER}/highlight-sync/no-kobo-import"
+
+    def test_shows_whether_the_kobo_import_is_done(self, world, session):
+        html = world.client.get(f"/admin/user/{USER}").get_data(as_text=True)
+        assert 'id="highlight-kobo-import">not done<' in html
+        assert "This user has no Kobo highlights to import" in html
+        session.add(HighlightDevice(user_id=USER, kobo_import_done=True))
+        session.commit()
+        html = world.client.get(f"/admin/user/{USER}").get_data(as_text=True)
+        assert 'id="highlight-kobo-import">done<' in html
+        assert "This user has no Kobo highlights to import" not in html
+
+    def test_marks_the_import_done_for_that_user_only(self, world, session):
+        session.add(HighlightDevice(user_id=USER, kobo_firmware="4.38.23852"))
+        session.commit()
+        resp = world.client.post(self.PATH)
+        assert resp.status_code == 302 and resp.headers["Location"].endswith(f"/admin/user/{USER}")
+        session.expire_all()
+        mine = session.query(HighlightDevice).filter_by(user_id=USER).one()
+        assert mine.kobo_import_done is True and mine.kobo_firmware == "4.38.23852"
+        assert session.query(HighlightDevice).filter_by(user_id=OTHER_USER).first() is None
+
+    def test_makes_the_device_row_when_there_is_none(self, world, session):
+        world.client.post(self.PATH)
+        session.expire_all()
+        assert session.query(HighlightDevice).filter_by(user_id=USER).one().kobo_import_done is True
+
+    def test_admin_only_post_only_and_unknown_user(self, world, session):
+        assert world.client.get(self.PATH).status_code == 405
+        assert world.client.post("/admin/user/99/highlight-sync/no-kobo-import").status_code == 404
+        world.admin = False
+        assert world.client.post(self.PATH).status_code == 403
+        assert session.query(HighlightDevice).count() == 0
+
+    def test_is_its_own_form_with_csrf_and_a_confirm(self, world, session):
+        forms = forms_of(world.client.get(f"/admin/user/{USER}").get_data(as_text=True))
+        form = next(f for f in forms if f["attrs"].get("action") == self.PATH)
+        assert form is not main_form(forms) and form["attrs"]["method"].lower() == "post"
+        assert any(i.get("name") == "csrf_token" and i.get("value") for i in form["inputs"])
+        assert len(submits(form)) == 1 and form["attrs"]["data-confirm"]
+        assert form["attrs"]["onsubmit"] == "return confirm(this.dataset.confirm);"
+
+
 class Forms(HTMLParser):
     """The page's forms: attributes, and the inputs and buttons inside each (nesting is tracked)."""
 

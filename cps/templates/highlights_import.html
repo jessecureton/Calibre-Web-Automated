@@ -40,6 +40,7 @@
       <tr><td>{{ _('Older copy: text inside a highlight CWA already has') }}</td><td>{{ counts.contained_in_existing }}</td></tr>
       {% endif %}
       <tr><td>{{ _('Could not be matched') }}</td><td>{{ counts.unmatched }}</td></tr>
+      <tr id="highlights_import_other"><td>{{ _('Bookmarks and other annotations (not imported)') }}</td><td>{{ plan.other_bookmarks_total() }}</td></tr>
     </tbody>
   </table>
 
@@ -49,7 +50,7 @@
       <tr>
         <th>{{ _('Book') }}</th><th>{{ _('New') }}</th><th>{{ _('Already in CWA') }}</th>
         {% if has_older %}<th>{{ _('Recovered') }}</th><th>{{ _('Inside an existing one') }}</th>{% endif %}
-        <th>{{ _('Not matched') }}</th>
+        <th>{{ _('Not matched') }}</th><th>{{ _('Bookmarks (not imported)') }}</th>
       </tr>
     </thead>
     <tbody>
@@ -58,6 +59,7 @@
         <td>{{ book.title }}</td><td>{{ book.new }}</td><td>{{ book.already_present }}</td>
         {% if has_older %}<td>{{ book.recovered }}</td><td>{{ book.contained_in_existing }}</td>{% endif %}
         <td>{{ book.unmatched }}{% for reason, count in book.reasons.items() %}<br><small>{{ count }} &times; {{ reason }}</small>{% endfor %}</td>
+        <td class="other-bookmarks">{{ book.other_bookmarks }}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -72,6 +74,12 @@
   </form>
   {% else %}
   <p>{{ _('There is nothing to import.') }}</p>
+  <form method="POST" action="{{ url_for('admin.highlights_import_apply') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button type="submit" class="btn btn-default">{{ _('Mark the Kobo import done') }}</button>
+    <p class="help-block" style="font-size: 11px;">{{ _('Highlights sync to the Kobo only once its own highlights are in CWA.') }}</p>
+  </form>
   {% endif %}
   {% endif %}
 </div>
