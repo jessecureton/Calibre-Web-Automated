@@ -22,7 +22,6 @@ from sqlalchemy import func
 
 from .. import settings
 from ... import ub
-from .bookorbit import release_held_deletions
 from .store import Highlight, HighlightDevice
 
 _TOKEN_PREFIX = re.compile(r"^(?:token|bearer)\s+", re.IGNORECASE)
@@ -81,4 +80,5 @@ def reset_readest_device(session, user_id: int) -> bool:
 
 def apply_held_deletions(session, user_id: int) -> int:
     """Apply every Readest deletion held for the user; returns how many highlights were deleted. The caller commits."""
+    from .bookorbit import release_held_deletions  # bookorbit -> kosync -> kobo -> web -> profile
     return release_held_deletions(session, user_id)
