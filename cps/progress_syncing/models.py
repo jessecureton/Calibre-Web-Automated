@@ -136,6 +136,7 @@ def ensure_app_db_tables(conn):
     Creates or validates tables that reference users:
     - kosync_progress: Stores reading progress from KOSync protocol
     - position_bridge_state: Kobo <-> KOSync position bridge state
+    - highlight, highlight_book_state, highlight_device: Kobo <-> Readest highlight sync
 
     Args:
         conn: SQLAlchemy connection object or sqlite3 connection for app.db
@@ -148,6 +149,8 @@ def ensure_app_db_tables(conn):
     ensure_kosync_progress_table(conn)
     from .position_bridge.state import ensure_position_bridge_table
     ensure_position_bridge_table(conn)
+    from .highlights.store import ensure_highlight_tables
+    ensure_highlight_tables(conn)
 
 
 def ensure_checksum_table(conn):

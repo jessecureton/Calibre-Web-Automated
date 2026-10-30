@@ -193,6 +193,21 @@
       <p class="cwa-settings-tooltip">
         {{_('When enabled (with KOReader Sync), a position read on a Kobo is sent to KOReader sync clients such as KOReader and Readest, and theirs to the Kobo, translated to the exact spot in each copy. Positions that cannot be translated are not synced.')}}
       </p>
+      {% if cwa_settings.get('kobo_readest_highlight_sync') %}
+      <input type="checkbox" id="kobo_readest_highlight_sync" name="kobo_readest_highlight_sync" value="True" checked style="accent-color: var(--color-secondary);" data-toggle="tooltip" data-placement="right" title="Does NOT require restart for changes to take effect">
+      {% else %}
+      <input type="checkbox" id="kobo_readest_highlight_sync" name="kobo_readest_highlight_sync" value="True" style="accent-color: var(--color-secondary);" data-toggle="tooltip" data-placement="right" title="Does NOT require restart for changes to take effect">
+      {% endif %}
+      <label for="kobo_readest_highlight_sync" style="padding-left: 10px;">{{_('Sync highlights between Kobo and Readest')}}</label><br>
+      <p class="cwa-settings-tooltip">
+        {{_('When enabled, highlights and notes made on a Kobo are sent to Readest, and those made in Readest are delivered to the Kobo, so both show the same set.')}}
+      </p>
+      <label for="highlight_sync_kobo_firmware" style="padding-left: 10px;">{{_('Kobo firmware verified for highlight delivery')}}</label><br>
+      <input type="text" class="cwa-settings-input" name="highlight_sync_kobo_firmware" id="highlight_sync_kobo_firmware" placeholder="4.38.23171, 4.40.1"
+             value="{{ cwa_settings.get('highlight_sync_kobo_firmware', '') }}" style="width: 320px; background: #151e2680; border: none; padding: 1rem; border-radius: 4px; margin-left: 1rem;">
+      <p class="cwa-settings-tooltip">
+        {{_('Comma-separated Kobo firmware versions on which highlights from Readest have been confirmed to appear on the device. Highlights are delivered to a Kobo only on these versions.')}}
+      </p>
       {% if cwa_settings.get('kindle_epub_fixer_aggressive') %}
       <input type="checkbox" id="kindle_epub_fixer_aggressive" name="kindle_epub_fixer_aggressive" value="True" checked style="accent-color: var(--color-secondary);" data-toggle="tooltip" data-placement="right" title="Riskier transformations; use only if safe mode fails">
       {% else %}

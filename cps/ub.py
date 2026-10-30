@@ -282,6 +282,10 @@ class User(UserBase, Base):
     kobo_only_shelves_sync = Column(Integer, default=0)
     opds_only_shelves_sync = Column(Integer, default=0)
     hardcover_token = Column(String, unique=True, default=None)
+    # Kobo <-> Readest highlight sync: the user's Readwise API token, and the md5 of the key
+    # their Readest sync client was last set up with
+    readwise_token = Column(String, nullable=True)
+    highlight_sync_key_md5 = Column(String, nullable=True)
     # New per-user theme (0=default/light, 1=caliBlur) replacing global-only behavior
     theme = Column(Integer, default=1)
     # Auto-send settings for new books
@@ -897,6 +901,20 @@ def migrate_user_table(engine, _session):
         _run_ddl_with_retry(engine, "ALTER TABLE user ADD column 'hardcover_token' String")
 
     try:
+        _session.query(exists().where(User.readwise_token)).scalar()
+        _session.commit()
+    except exc.OperationalError:
+        _safe_session_rollback(_session, "user.readwise_token")
+        _run_ddl_with_retry(engine, "ALTER TABLE user ADD column 'readwise_token' String")
+
+    try:
+        _session.query(exists().where(User.highlight_sync_key_md5)).scalar()
+        _session.commit()
+    except exc.OperationalError:
+        _safe_session_rollback(_session, "user.highlight_sync_key_md5")
+        _run_ddl_with_retry(engine, "ALTER TABLE user ADD column 'highlight_sync_key_md5' String")
+
+    try:
         _session.query(exists().where(User.opds_only_shelves_sync)).scalar()
         _session.commit()
     except exc.OperationalError:
@@ -1130,9 +1148,12 @@ def migrate_Database(_session):
 
     # Ensure progress syncing tables in app.db (user-related tables)
     from .progress_syncing.models import ensure_app_db_tables
-    from .progress_syncing.settings import is_koreader_sync_enabled
+    from .progress_syncing.settings import is_koreader_sync_enabled, highlight_sync_ever_enabled
     if is_koreader_sync_enabled():
         ensure_app_db_tables(engine.raw_connection())
+    elif highlight_sync_ever_enabled():
+        from .progress_syncing.highlights.store import ensure_highlight_tables
+        ensure_highlight_tables(engine.raw_connection())
     
     # Migrate system magic shelves for existing users
     try:

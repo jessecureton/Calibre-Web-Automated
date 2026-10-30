@@ -40,6 +40,7 @@ from .tasks.database import TaskReconnectDatabase
 from .tasks.auto_send import TaskAutoSend
 from .tasks.ops import TaskConvertLibraryRun, TaskEpubFixerRun
 from .internal_api import internal_only
+from .progress_syncing.settings import apply_highlight_sync_ever
 
 switch_theme = Blueprint('switch_theme', __name__)
 library_refresh = Blueprint('library_refresh', __name__)
@@ -661,6 +662,7 @@ def set_cwa_settings():
     cwa_default_settings = cwa_db.cwa_default_settings
     cwa_settings = cwa_db.cwa_settings
     previous_koreader_enabled = bool(cwa_settings.get('koreader_sync_enabled', 0))
+    previous_highlight_sync_enabled = bool(cwa_settings.get('kobo_readest_highlight_sync', 0))
 
     ignorable_formats = ['acsm', 'azw', 'azw3', 'azw4', 'cbz',
                         'cbr', 'cb7', 'cbc', 'chm',
@@ -696,6 +698,10 @@ def set_cwa_settings():
     if 'duplicate_scan_cron' not in string_settings:
         string_settings.append('duplicate_scan_cron')
 
+    # Empty by default, so not picked up above
+    if 'highlight_sync_kobo_firmware' not in string_settings:
+        string_settings.append('highlight_sync_kobo_firmware')
+
     # Ensure archived cleanup schedule fields are treated as strings
     if 'archived_cleanup_schedule' not in string_settings:
         string_settings.append('archived_cleanup_schedule')
@@ -718,6 +724,8 @@ def set_cwa_settings():
                 else:
                     value = 1
                 result |= {setting:value}
+            # "ever enabled" is set by the save, never by a form field
+            apply_highlight_sync_ever(result, cwa_settings)
             # set string settings
             for setting in string_settings:
                 value = request.form.get(setting)
@@ -736,6 +744,10 @@ def set_cwa_settings():
                 elif setting == "auto_convert_target_format":
                     if value is None:
                         value = cwa_db.cwa_settings['auto_convert_target_format']
+                elif setting == "highlight_sync_kobo_firmware":
+                    if value is None:
+                        value = cwa_db.cwa_settings.get(setting, '')
+                    value = value.strip()
 
                 result |= {setting:value}
             
@@ -938,6 +950,15 @@ def set_cwa_settings():
                 except Exception as e:
                     log.warning("[cwa-duplicates] Could not mark duplicate index pending: %s", str(e))
 
+            # If highlight sync was just enabled, ensure its tables exist
+            if not previous_highlight_sync_enabled and bool(cwa_settings.get('kobo_readest_highlight_sync', 0)):
+                try:
+                    from .progress_syncing.highlights.store import ensure_highlight_tables
+                    if ub.session and ub.session.bind is not None:
+                        ensure_highlight_tables(ub.session.bind.raw_connection())
+                except Exception as e:
+                    log.error(f"Failed to initialize highlight sync tables: {e}")
+
             # If KOReader sync was just enabled, ensure required tables exist
             if not previous_koreader_enabled and bool(cwa_settings.get('koreader_sync_enabled', 0)):
                 log.warning(
@@ -976,7 +997,11 @@ def set_cwa_settings():
                 duplicate_criteria_changed = previous_fingerprint != get_criteria_fingerprint(default_settings)
             except Exception as e:
                 log.warning("[cwa-duplicates] Could not compare duplicate criteria defaults: %s", str(e))
+            highlight_sync_was_ever_enabled = bool(cwa_settings.get('kobo_readest_highlight_sync_ever', 0))
             cwa_db.set_default_settings(force=True)
+            if highlight_sync_was_ever_enabled:
+                # Resetting to defaults must not make synced highlights look unsynced
+                cwa_db.update_cwa_settings({'kobo_readest_highlight_sync_ever': 1})
             cwa_settings = cwa_db.get_cwa_settings()
             if duplicate_criteria_changed:
                 try:
