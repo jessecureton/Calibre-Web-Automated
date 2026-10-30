@@ -56,6 +56,7 @@ EXPECTED = {
     },
     "highlight_book_state": {
         "id", "user_id", "book_id", "kobo_etag_version", "kobo_delivered_version",
+        "readwise_backfill_done",
     },
     "highlight_device": {"id", "user_id", "kobo_firmware", "readest_device_id"},
     "kobo_opaque_annotation": {"id", "user_id", "book_id", "kobo_id", "raw", "updated_at", "deleted_at"},

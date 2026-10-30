@@ -70,6 +70,7 @@ def register_scheduled_tasks(reconnect=True):
                            name="end scheduled task")
 
         _schedule_hardcover_auto_fetch(scheduler, timezone_info)
+        _schedule_readwise_highlights(scheduler, timezone_info)
         _schedule_archived_book_cleanup(scheduler, timezone_info)
 
         # Kick-off tasks, if they should currently be running
@@ -312,6 +313,23 @@ def _schedule_hardcover_auto_fetch(scheduler, timezone_info):
         
         if trigger:
             scheduler.schedule_task(task_lambda, user='System', trigger=trigger, name=name, hidden=False)
+    except Exception:
+        # Scheduling is best-effort; never block startup
+        pass
+
+
+def _schedule_readwise_highlights(scheduler, timezone_info):
+    """Every 5 minutes, send changed highlights to Readwise. Registered only when
+    Kobo <-> Readest highlight sync is on."""
+    try:
+        from .progress_syncing import settings
+        from .tasks.readwise_highlights import TaskReadwiseHighlights
+
+        if not settings.is_highlight_sync_enabled():
+            return
+        scheduler.schedule_task(lambda: TaskReadwiseHighlights(), user='System',
+                                trigger=IntervalTrigger(minutes=5, timezone=timezone_info),
+                                name='readwise highlights', hidden=True)
     except Exception:
         # Scheduling is best-effort; never block startup
         pass

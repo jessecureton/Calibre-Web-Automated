@@ -111,6 +111,8 @@ class HighlightBookState(AppBase):
     Fields:
         kobo_etag_version: bumped on every change to a book's highlights; the Kobo's ETag source
         kobo_delivered_version: the kobo_etag_version last delivered to the user's Kobo
+        readwise_backfill_done: the Readwise outbox has checked this book against what
+            Readwise already holds, so it never does so again
     """
     __tablename__ = 'highlight_book_state'
     __table_args__ = (UniqueConstraint('user_id', 'book_id'),)
@@ -120,6 +122,7 @@ class HighlightBookState(AppBase):
     book_id = Column(Integer, nullable=False)
     kobo_etag_version = Column(Integer, nullable=False, default=0, server_default='0')
     kobo_delivered_version = Column(Integer, nullable=False, default=0, server_default='0')
+    readwise_backfill_done = Column(Boolean, nullable=False, default=False, server_default='0')
 
 
 class HighlightDevice(AppBase):
@@ -179,6 +182,7 @@ _HIGHLIGHT_COLUMNS = (
 _BOOK_STATE_COLUMNS = (
     "kobo_etag_version INTEGER NOT NULL DEFAULT 0",
     "kobo_delivered_version INTEGER NOT NULL DEFAULT 0",
+    "readwise_backfill_done BOOLEAN NOT NULL DEFAULT 0",
 )
 _DEVICE_COLUMNS = ("kobo_firmware TEXT", "readest_device_id TEXT")
 _OPAQUE_COLUMNS = ("raw TEXT NOT NULL DEFAULT '{}'", "updated_at TIMESTAMP", "deleted_at TIMESTAMP")
