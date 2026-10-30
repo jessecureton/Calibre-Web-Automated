@@ -8,6 +8,7 @@
 
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -20,11 +21,16 @@ from sqlalchemy.orm import sessionmaker
 from cps import kobo, readingservices, ub
 from cps.progress_syncing import settings
 from cps.progress_syncing.highlights import kobo_side
-from cps.progress_syncing.highlights.store import Highlight, HighlightBookState, HighlightDevice, upsert_from_side
+from cps.progress_syncing.highlights.store import (
+    Highlight, HighlightBookState, HighlightDevice, KoboOpaqueAnnotation, upsert_from_side,
+)
 from cps.progress_syncing.position_bridge import service as bridge_service
 
 from .position_bridge_books import CH1, CH2, kepubify_like, write_book
-from .test_highlights_kobo_side import CROSS_CHAPTER, FIRMWARE, UA, annotation, ch2_xpointers
+from .test_highlights_kobo_side import CROSS_CHAPTER, FIRMWARE, UA, annotation, ch2_xpointers, dogear_entry
+
+REAL_EVER = settings.highlight_sync_ever_enabled
+REAL_ON = settings.is_highlight_sync_enabled
 
 USER, BOOK = 3, 1
 UUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"      # a CWA book
@@ -73,6 +79,12 @@ class FakeCalibre:
         if book_uuid == UUID:
             return SimpleNamespace(id=BOOK, title="t", identifiers=[], data=[], path="p")
         return None
+
+
+@pytest.fixture(autouse=True)
+def fresh_caches(monkeypatch):
+    monkeypatch.setattr(readingservices, "_known_books", {})
+    monkeypatch.setattr(settings, "_ever_seen", set())
 
 
 @pytest.fixture
@@ -248,6 +260,39 @@ class TestPatch:
         r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
         assert r.status_code == 204
 
+    @pytest.mark.parametrize("body", [
+        [annotation()],
+        "just a string",
+        {"updatedAnnotations": [annotation(), "junk"]},
+        {"updatedAnnotations": [{k: v for k, v in annotation().items() if k != "id"}]},
+        {"updatedAnnotations": annotation()},
+        {"deletedAnnotationIds": [KOBO_ID, None]},
+    ])
+    def test_unfit_body_gets_400_and_stores_nothing(self, client, session, body):
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json=body, headers=HEADERS)
+        assert r.status_code == 400
+        assert session.query(Highlight).count() == 0
+        assert session.query(KoboOpaqueAnnotation).count() == 0
+
+    def test_unreadable_json_gets_400(self, client, session):
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", data=b"{not json",
+                         headers={**HEADERS, "Content-Type": "application/json"})
+        assert r.status_code == 400
+
+    def test_dogear_is_stored_and_echoed(self, client, session, monkeypatch):
+        r = client.patch(f"/api/v3/content/{UUID}/annotations",
+                         json=patch_body(annotation(), dogear_entry()), headers=HEADERS)
+        assert r.status_code == 204
+        no_proxy(monkeypatch)
+        body = client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS).get_json()
+        assert dogear_entry() in body["annotations"] and len(body["annotations"]) == 2
+
+    def test_store_failure_log_survives_an_odd_body(self, client, session, monkeypatch):
+        monkeypatch.setattr(kobo_side, "kobo_patch_error", lambda body: None)
+        r = client.patch(f"/api/v3/content/{UUID}/annotations",
+                         json={"updatedAnnotations": 5, "deletedAnnotationIds": "x"}, headers=HEADERS)
+        assert r.status_code == 503
+
     def test_patch_records_firmware(self, client, session):
         client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
         assert session.query(HighlightDevice).one().kobo_firmware == FIRMWARE
@@ -366,6 +411,21 @@ class TestGet:
         client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
         assert session.query(HighlightDevice).one().kobo_firmware == FIRMWARE
 
+    def test_lookup_failure_for_a_known_book_serves_the_stored_set(self, client, session, calibre, monkeypatch):
+        client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation(), dogear_entry()),
+                     headers=HEADERS)
+        calibre.raises = RuntimeError("calibre db locked")
+        no_proxy(monkeypatch)
+        r = client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
+        assert r.status_code == 200
+        assert sorted(e["id"] for e in r.get_json()["annotations"]) == sorted([KOBO_ID, dogear_entry()["id"]])
+        assert r.headers["ETag"] == kobo_side.FALLBACK_ETAG
+
+    def test_lookup_failure_for_a_never_seen_uuid_is_503(self, client, calibre, monkeypatch):
+        calibre.raises = RuntimeError("calibre db locked")
+        no_proxy(monkeypatch)
+        assert client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS).status_code == 503
+
     def test_unauthenticated_get_for_cwa_book_is_not_proxied(self, client, user, monkeypatch):
         user.is_authenticated = False
         no_proxy(monkeypatch)
@@ -384,6 +444,16 @@ class TestCheckForChanges:
         r = client.post("/api/v3/content/checkforchanges", json=[{"ContentId": UUID, "etag": 'W/"cwa-1"'}],
                         headers=HEADERS)
         assert r.get_json() == []
+
+    def test_first_sync_names_only_books_with_cwa_content(self, client, session, calibre, monkeypatch):
+        other = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        real = calibre.get_book_by_uuid
+        monkeypatch.setattr(calibre, "get_book_by_uuid",
+                            lambda u: SimpleNamespace(id=7) if u == other else real(u))
+        client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        no_proxy(monkeypatch)
+        batch = [{"ContentId": UUID, "etag": 'W/"0"'}, {"ContentId": other, "etag": 'W/"0"'}]
+        assert client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS).get_json() == [UUID]
 
     def test_checkforchanges_empty_when_firmware_untested(self, client, session, monkeypatch):
         client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
@@ -422,6 +492,16 @@ class TestCheckForChanges:
         kobo_cloud.raises = requests.exceptions.ConnectionError("down")
         r = client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS)
         assert (r.status_code, r.get_json()) == (200, [UUID])
+
+    def test_success_never_rolls_back_the_shared_session(self, client, session, monkeypatch):
+        client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        rollbacks = []
+        monkeypatch.setattr(session, "rollback", lambda: rollbacks.append(1))
+        r = client.post("/api/v3/content/checkforchanges", json=[{"ContentId": UUID, "etag": 'W/"0"'}],
+                        headers=HEADERS)
+        assert r.get_json() == [UUID]
+        client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
+        assert rollbacks == []
 
     def test_all_cwa_batch_is_not_proxied(self, client, session, monkeypatch):
         no_proxy(monkeypatch)
@@ -532,3 +612,70 @@ class TestInitAndNeverOn:
         monkeypatch.setattr(settings, "is_highlight_sync_enabled", fail)
         monkeypatch.setattr(settings, "highlight_sync_ever_enabled", fail)
         assert app.test_client().get("/").status_code == 200
+
+
+@pytest.mark.unit
+class TestRoutingDecision:
+    def test_settings_failing_after_ever_was_read_still_route_to_cwa(self, client, session, monkeypatch, tmp_path):
+        import sqlite3
+        monkeypatch.setenv("CWA_DB_PATH", str(tmp_path))
+        con = sqlite3.connect(tmp_path / "cwa.db")
+        con.execute("CREATE TABLE cwa_settings (kobo_readest_highlight_sync, kobo_readest_highlight_sync_ever)")
+        con.execute("INSERT INTO cwa_settings VALUES (0, 1)")
+        con.commit()
+        con.close()
+        monkeypatch.setattr(settings, "highlight_sync_ever_enabled", REAL_EVER)
+        monkeypatch.setattr(settings, "is_highlight_sync_enabled", REAL_ON)
+        assert settings.highlight_sync_ever_enabled() is True
+        (tmp_path / "cwa.db").unlink()
+
+        def broken(*a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(settings, "_read_row_directly", broken)
+        monkeypatch.setitem(sys.modules, "cwa_db", None)  # the CWA_DB() fallback can't load either
+        no_proxy(monkeypatch)
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        assert r.status_code == 204 and session.query(Highlight).count() == 1
+        r = client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
+        assert r.status_code == 200 and len(r.get_json()["annotations"]) == 1
+
+    def test_settings_failing_before_ever_was_seen_answer_as_today(self, client, session, kobo_cloud,
+                                                                   monkeypatch, tmp_path):
+        monkeypatch.setenv("CWA_DB_PATH", str(tmp_path))  # no cwa.db here
+        monkeypatch.setattr(settings, "highlight_sync_ever_enabled", REAL_EVER)
+        monkeypatch.setattr(settings, "is_highlight_sync_enabled", REAL_ON)
+        monkeypatch.setitem(sys.modules, "cwa_db", None)
+        r = client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
+        assert (r.status_code, r.get_json()) == (200, {"data": [], "totalResults": 0})
+        assert kobo_cloud.calls == []
+
+    @pytest.mark.parametrize("method", ["GET", "PATCH", "POST"])
+    def test_a_flipping_read_cannot_proxy_a_cwa_book(self, client, session, monkeypatch, method):
+        answers = iter([True] + [False] * 10)
+        calls = []
+
+        def flipping():
+            calls.append(1)
+            return next(answers)
+        monkeypatch.setattr(kobo_side, "highlight_routing_active", flipping)
+        no_proxy(monkeypatch)
+        if method == "GET":
+            r = client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
+            assert r.status_code == 200 and "annotations" in r.get_json()
+        elif method == "PATCH":
+            r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()),
+                             headers=HEADERS)
+            assert r.status_code == 204 and session.query(Highlight).count() == 1
+        else:
+            r = client.post("/api/v3/content/checkforchanges", json=[{"ContentId": UUID, "etag": 'W/"0"'}],
+                            headers=HEADERS)
+            assert (r.status_code, r.get_json()) == (200, [])
+        assert len(calls) == 1
+
+    def test_a_raising_read_answers_as_today(self, client, session, kobo_cloud, monkeypatch):
+        def boom():
+            raise RuntimeError("settings unreadable")
+        monkeypatch.setattr(kobo_side, "highlight_routing_active", boom)
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        assert (r.status_code, r.get_json()) == (200, {"data": [], "totalResults": 0})
+        assert kobo_cloud.calls == [] and session.query(Highlight).count() == 0

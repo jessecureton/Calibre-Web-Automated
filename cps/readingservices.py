@@ -21,7 +21,7 @@ import re
 from datetime import datetime, timezone
 from functools import wraps
 from typing import TypedDict, NotRequired
-from flask import Blueprint, request, make_response, jsonify, abort
+from flask import Blueprint, request, make_response, jsonify, abort, g
 from werkzeug.datastructures import Headers
 import requests
 from lxml import etree
@@ -162,16 +162,52 @@ def highlight_route(method, path):
     return None
 
 
+# uuid -> CWA book id, from successful lookups. Lets a GET for a book CWA has
+# already identified be answered from the store while the calibre DB is failing.
+_known_books = {}
+_KNOWN_BOOKS_MAX = 50000
+
+LOOKUP_OK, LOOKUP_CACHED, LOOKUP_FAILED = "ok", "cached", "failed"
+
+
+def highlight_routing_for_request():
+    """Whether CWA owns the Kobo's highlight routes, decided once per request.
+
+    The kobo stub decides first; the readingservices decorator reuses its answer,
+    so the two can never disagree. A failed settings read before "ever on" has
+    been seen answers False: as today, the only state a failed read can't rule out.
+    """
+    decided = g.get("highlight_routing")
+    if decided is None:
+        try:
+            decided = bool(kobo_side.highlight_routing_active())
+        except Exception as e:
+            log.warning(f"[highlight-sync] could not read the highlight sync settings: {type(e).__name__}")
+            decided = False
+        g.highlight_routing = decided
+    return decided
+
+
 def _cwa_book_id(entitlement_id):
-    """(book id or None for a book CWA doesn't own, lookup_failed)."""
+    """(book id or None for a book CWA doesn't own, LOOKUP_OK | LOOKUP_CACHED | LOOKUP_FAILED).
+
+    LOOKUP_CACHED: the lookup failed, but an earlier one found this CWA book.
+    """
     for attempt in range(2):
         try:
             book = calibre_db.get_book_by_uuid(entitlement_id)
-            return (book.id if book else None), False
         except Exception as e:
             log.warning(f"[highlight-sync] book lookup for {entitlement_id} failed "
                         f"(attempt {attempt + 1}): {type(e).__name__}")
-    return None, True
+            continue
+        if book is None:
+            return None, LOOKUP_OK
+        if entitlement_id not in _known_books and len(_known_books) < _KNOWN_BOOKS_MAX:
+            _known_books[entitlement_id] = book.id
+        return book.id, LOOKUP_OK
+    if entitlement_id in _known_books:
+        return _known_books[entitlement_id], LOOKUP_CACHED
+    return None, LOOKUP_FAILED
 
 
 def _rollback(session=None):
@@ -198,9 +234,10 @@ def handle_highlight_route(kind, entitlement_id):
     if kind == "checkforchanges":
         return _highlight_check_for_changes()
 
-    book_id, lookup_failed = _cwa_book_id(entitlement_id)
-    if lookup_failed:
-        # Can't tell a CWA book from a store book, so neither serve nor proxy.
+    book_id, lookup = _cwa_book_id(entitlement_id)
+    if lookup == LOOKUP_FAILED:
+        # Never identified as a CWA book, so no CWA set was ever served for it;
+        # but it can't be told from a store book now, so neither serve nor proxy.
         log.error(f"[highlight-sync] {request.method} annotations for {entitlement_id}: book lookup failed")
         return make_response("", 503)
     if book_id is None:
@@ -215,6 +252,9 @@ def handle_highlight_route(kind, entitlement_id):
     user_id = current_user.id
     firmware = _record_firmware(user_id)
     if request.method == "GET":
+        if lookup == LOOKUP_CACHED:
+            # The library can't be read: serve what the device already holds.
+            return _annotation_response(_stored_annotation_set(user_id, book_id), kobo_side.FALLBACK_ETAG)
         return _highlight_annotations_get(user_id, book_id, firmware)
     return _highlight_annotations_patch(entitlement_id, user_id, book_id)
 
@@ -249,7 +289,6 @@ def _stored_annotation_set(user_id, book_id):
     try:
         body, _ = kobo_side.kobo_annotation_set(ub.session, user_id, book_id, None, None,
                                                 translate_missing=False)
-        _rollback()
         return body
     except Exception as e:
         log.warning(f"[highlight-sync] user={user_id} book={book_id}: stored set failed "
@@ -278,23 +317,29 @@ def _stored_annotation_set(user_id, book_id):
     return {"annotations": [], "nextPageOffsetToken": None}
 
 
+def _count(value):
+    return len(value) if isinstance(value, list) else 0
+
+
 def _highlight_annotations_patch(entitlement_id, user_id, book_id):
-    """Store, then 204 with an empty body; 503 if storing fails, so the Kobo retries."""
+    """Store, then 204 with an empty body. 400 for a body that can't be stored whole
+    and 503 if storing fails, so the Kobo keeps the annotations and retries."""
     data = request.get_json(silent=True)
-    if data is None and request.get_data().strip():
-        log.warning(f"[highlight-sync] user={user_id} book={book_id}: unreadable annotations PATCH body")
-        return make_response("", 400)
-    if not isinstance(data, dict):
-        data = {}
+    if data is None and not request.get_data().strip():
+        data = {}  # an empty PATCH is a legitimate no-op
+    error = "unreadable JSON" if data is None else kobo_side.kobo_patch_error(data)
+    if error:
+        log.warning(f"[highlight-sync] user={user_id} book={book_id}: rejected annotations PATCH ({error})")
+        return make_response(jsonify({"error": error}), 400)
     try:
         kobo_side.apply_kobo_patch(ub.session, user_id, book_id, data, datetime.now(timezone.utc),
                                    files=bridge_service.library_files)
         ub.session.commit()
     except Exception as e:
-        updated = len(data.get("updatedAnnotations") or [])
-        deleted = len(data.get("deletedAnnotationIds") or [])
         log.warning(f"[highlight-sync] user={user_id} book={book_id}: storing a Kobo PATCH "
-                    f"(updated={updated} deleted={deleted}) failed ({type(e).__name__}); answering 503")
+                    f"(updated={_count(data.get('updatedAnnotations'))} "
+                    f"deleted={_count(data.get('deletedAnnotationIds'))}) failed "
+                    f"({type(e).__name__}); answering 503")
         _rollback()
         return make_response("", 503)
     if config.config_hardcover_annotations_sync and config.config_kobo_sync:
@@ -318,8 +363,8 @@ def _highlight_check_for_changes():
         if not isinstance(content_id, str):
             others.append(entry)
             continue
-        book_id, lookup_failed = _cwa_book_id(content_id)
-        if lookup_failed:
+        book_id, lookup = _cwa_book_id(content_id)
+        if lookup == LOOKUP_FAILED:
             unknown += 1  # maybe a CWA book: neither name nor proxy it
         elif book_id is None:
             others.append(entry)
@@ -345,7 +390,6 @@ def _highlight_check_for_changes():
             log.warning(f"[highlight-sync] user={user_id}: checkforchanges failed ({type(e).__name__}); "
                         f"naming no CWA books")
             named = []
-        finally:
             _rollback()
 
     proxied = []
@@ -371,7 +415,7 @@ def requires_reading_services_auth_and_config(f):
         # Kobo <-> Readest highlight sync answers these for CWA books, whatever
         # the Hardcover settings say. None means: carry on as before.
         route = highlight_route(request.method, request.path)
-        if route and kobo_side.highlight_routing_active():
+        if route and highlight_routing_for_request():
             response = handle_highlight_route(*route)
             if response is not None:
                 return response

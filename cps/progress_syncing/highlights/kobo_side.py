@@ -18,6 +18,7 @@ device is withheld, never approximated.
 Callers own the transaction: these functions flush but never commit.
 """
 
+import json
 import re
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,8 @@ from .store import (
     Highlight,
     HighlightBookState,
     HighlightDevice,
+    KoboOpaqueAnnotation,
+    _bump_book,
     _find_merge_candidate,
     _utc,
     delete_from_side,
@@ -54,7 +57,8 @@ READEST_TO_KOBO_COLOR = {
 }
 KOBO_TO_READEST_COLOR = {hex_.upper(): name for name, hex_ in READEST_TO_KOBO_COLOR.items()}
 
-# The Kobo annotation types that are highlights; "dogear" (a bookmark) is not.
+# The Kobo annotation types that are highlights. Anything else (a dogear, i.e. a
+# bookmark) is kept verbatim as a KoboOpaqueAnnotation and echoed back.
 ANNOTATION_TYPES = ("highlight", "note")
 
 _FIRMWARE = re.compile(r"Kobo Touch [0-9A-Za-z]+/(\d+(?:\.\d+)+)")
@@ -64,8 +68,12 @@ _KOBO_FIELDS = ("kobo_chapter", "kobo_start_path", "kobo_start_char",
 
 
 def highlight_routing_active() -> bool:
-    """Whether CWA answers the Kobo's highlight calls: the setting is on, or was ever on."""
-    return settings.is_highlight_sync_enabled() or settings.highlight_sync_ever_enabled()
+    """Whether CWA answers the Kobo's highlight calls: the setting is on, or was ever on.
+
+    "Ever on" is asked first: once it has been read as on, the process remembers
+    it, so this answer can no longer fail or flip.
+    """
+    return settings.highlight_sync_ever_enabled() or settings.is_highlight_sync_enabled()
 
 
 def delivers_to(firmware: Optional[str]) -> bool:
@@ -206,6 +214,58 @@ def _kobo_xpointers(books: _Books, location: dict, kobo_id: str):
     return xps or (None, None)
 
 
+def kobo_patch_error(body) -> Optional[str]:
+    """Why a PATCH body can't be stored whole, or None. Nothing in it may be acknowledged unstored."""
+    if not isinstance(body, dict):
+        return "body is not an object"
+    updated = body.get("updatedAnnotations")
+    if updated is not None:
+        if not isinstance(updated, list):
+            return "updatedAnnotations is not a list"
+        for entry in updated:
+            if not isinstance(entry, dict):
+                return "an updatedAnnotations entry is not an object"
+            if not isinstance(entry.get("id"), str) or not entry["id"]:
+                return "an updatedAnnotations entry has no id"
+    deleted = body.get("deletedAnnotationIds")
+    if deleted is not None:
+        if not isinstance(deleted, list):
+            return "deletedAnnotationIds is not a list"
+        if not all(isinstance(i, str) and i for i in deleted):
+            return "a deletedAnnotationIds entry is not an id"
+    return None
+
+
+def _opaque(session, user_id: int, kobo_id: str) -> Optional[KoboOpaqueAnnotation]:
+    return session.query(KoboOpaqueAnnotation).filter(
+        KoboOpaqueAnnotation.user_id == user_id, KoboOpaqueAnnotation.kobo_id == kobo_id).first()
+
+
+def _store_opaque(session, user_id: int, book_id: int, entry: dict, modified: Optional[datetime],
+                  now: datetime) -> None:
+    """Keep a Kobo annotation verbatim. Only the Kobo writes these, so its latest report wins."""
+    raw = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    row = _opaque(session, user_id, entry["id"])
+    if row is None:
+        session.add(KoboOpaqueAnnotation(user_id=user_id, book_id=book_id, kobo_id=entry["id"],
+                                         raw=raw, updated_at=modified or _utc(now)))
+        _bump_book(session, user_id, book_id)
+    else:
+        changed = row.raw != raw or row.deleted_at is not None
+        row.raw, row.deleted_at, row.updated_at = raw, None, modified or _utc(now)
+        if changed:
+            _bump_book(session, user_id, row.book_id)
+    session.flush()
+
+
+def _delete_opaque(session, user_id: int, kobo_id: str, now: datetime) -> None:
+    row = _opaque(session, user_id, kobo_id)
+    if row is not None and row.deleted_at is None:
+        row.deleted_at = row.updated_at = _utc(now)
+        _bump_book(session, user_id, row.book_id)
+        session.flush()
+
+
 def apply_kobo_patch(session, user_id: int, book_id: int, body: dict, now: datetime,
                      files: FilesLookup = library_files) -> None:
     """
@@ -215,45 +275,56 @@ def apply_kobo_patch(session, user_id: int, book_id: int, body: dict, now: datet
     kept verbatim and XPointers computed from it (None when untranslatable, or
     when the Kobo holds a different KEPUB than the library's). An empty or
     unreadable `clientLastModifiedUtc` is unknown: a create is dated `now`, and an
-    edit to an existing highlight never wins. Entries of other types (a dogear)
-    are skipped. Each `deletedAnnotationIds` entry is marked deleted.
+    edit to an existing highlight never wins.
+
+    An entry CWA can't hold as a highlight (another type, such as a dogear, or a
+    new highlight without a complete location) is kept verbatim as a
+    KoboOpaqueAnnotation, to be echoed back by the GET. An edit without a
+    complete location to a highlight CWA already places keeps its stored location.
+    Each `deletedAnnotationIds` entry is marked deleted, highlight or opaque.
+
+    Raises ValueError, storing nothing, if `kobo_patch_error` finds the body unfit.
     """
-    body = body or {}
-    updated = [e for e in (body.get("updatedAnnotations") or []) if isinstance(e, dict)]
-    deleted = [i for i in (body.get("deletedAnnotationIds") or []) if isinstance(i, str) and i]
+    error = kobo_patch_error(body)
+    if error:
+        raise ValueError(error)
+    updated = body.get("updatedAnnotations") or []
+    deleted = body.get("deletedAnnotationIds") or []
     books = None
-    stored = untranslated = 0
+    stored = opaque = untranslated = 0
     for entry in updated:
-        kobo_id = entry.get("id")
-        if not isinstance(kobo_id, str) or not kobo_id:
-            log.warning(f"[highlight-sync] user={user_id} book={book_id}: skipped a Kobo annotation without an id")
+        kobo_id = entry["id"]
+        location = _location(entry)
+        modified = _parse_kobo_time(entry.get("clientLastModifiedUtc"))
+        existing = session.query(Highlight).filter(
+            Highlight.user_id == user_id, Highlight.kobo_id == kobo_id).first()
+        highlight_type = entry.get("type", "highlight") in ANNOTATION_TYPES
+        keep_location = highlight_type and not _complete(location) and \
+            existing is not None and _has_range(existing)
+        if not highlight_type or not (_complete(location) or keep_location):
+            _store_opaque(session, user_id, book_id, entry, modified, now)
+            opaque += 1
             continue
-        if entry.get("type", "highlight") not in ANNOTATION_TYPES:
-            # A dogear (bookmark) is not a highlight; the store has no place for it.
-            log.warning(f"[highlight-sync] user={user_id} book={book_id}: skipped Kobo annotation "
-                        f"{kobo_id} of type {str(entry.get('type'))[:20]!r}")
-            continue
+
         if books is None:
             epub_path, kepub_path = files(book_id)
             books = _Books(session, user_id, book_id, epub_path, kepub_path)
-        location = _location(entry)
         note = entry.get("noteText") or None
-        fields = {"text": entry.get("highlightedText"), "note": note, **location}
+        fields = {"text": entry.get("highlightedText"), "note": note}
+        if not keep_location:
+            fields.update(location)
         if KOBO_SENDS_COLOR and isinstance(entry.get("highlightColor"), str):
             color = KOBO_TO_READEST_COLOR.get(entry["highlightColor"].upper())
             if color:
                 fields["color"] = color
 
-        existing = session.query(Highlight).filter(
-            Highlight.user_id == user_id, Highlight.kobo_id == kobo_id).first()
-        moved = existing is None or existing.xp0 is None or \
-            any(getattr(existing, name) != location[name] for name in _KOBO_FIELDS)
+        moved = not keep_location and (existing is None or existing.xp0 is None or
+                                       any(getattr(existing, name) != location[name] for name in _KOBO_FIELDS))
         if moved:
             xps = _kobo_xpointers(books, location, kobo_id)
             fields["xp0"], fields["xp1"] = xps if xps else (None, None)
             untranslated += fields["xp0"] is None
 
-        modified = _parse_kobo_time(entry.get("clientLastModifiedUtc"))
         if modified is None:
             anchor = existing or _find_merge_candidate(session, user_id, book_id, "kobo", fields)
             if anchor is not None and anchor.updated_at is not None:
@@ -268,13 +339,15 @@ def apply_kobo_patch(session, user_id: int, book_id: int, body: dict, now: datet
             for name in _KOBO_FIELDS:
                 setattr(row, name, location[name])
             session.flush()
+        _delete_opaque(session, user_id, kobo_id, now)  # now held as a highlight
         stored += 1
 
     for kobo_id in deleted:
         delete_from_side(session, user_id, book_id, "kobo", kobo_id, now)
-    if stored or deleted:
+        _delete_opaque(session, user_id, kobo_id, now)
+    if stored or opaque or deleted:
         log.info(f"[highlight-sync] user={user_id} book={book_id}: kobo patch "
-                 f"updated={stored} deleted={len(deleted)} untranslated={untranslated}")
+                 f"highlights={stored} opaque={opaque} deleted={len(deleted)} untranslated={untranslated}")
 
 
 def _color(row) -> Optional[str]:
@@ -319,7 +392,8 @@ def kobo_annotation_set(session, user_id: int, book_id: int, kepub_path: Optiona
     """
     The complete annotation GET answer for a book, and its ETag.
 
-    Every live highlight with a stored Kobo range is served as stored. With
+    Every live highlight with a stored Kobo range is served as stored, and every
+    live opaque annotation (a dogear, say) exactly as the Kobo sent it. With
     `translate_missing`, a highlight without one (from Readest) gets a range from
     its XPointers, stored once with a new uuid4 `kobo_id` (no version bump: it is
     not a content change), or is withheld if it can't be translated or the Kobo
@@ -361,6 +435,13 @@ def kobo_annotation_set(session, user_id: int, book_id: int, kepub_path: Optiona
             continue
         _store_range(row, r)
         entries.append(_entry(row))
+    served = {entry["id"] for entry in entries}
+    for row in session.query(KoboOpaqueAnnotation).filter(
+            KoboOpaqueAnnotation.user_id == user_id, KoboOpaqueAnnotation.book_id == book_id,
+            KoboOpaqueAnnotation.deleted_at.is_(None)).order_by(KoboOpaqueAnnotation.id):
+        if row.kobo_id not in served:
+            entries.append(json.loads(row.raw))
+            served.add(row.kobo_id)
     session.flush()
     if untranslatable or withheld:
         log.warning(f"[highlight-sync] user={user_id} book={book_id}: served {len(entries)} highlights to "
@@ -374,13 +455,15 @@ def kobo_changed_books(session, user_id: int, entries: list, firmware: Optional[
     """
     The ContentIds of a checkforchanges batch whose highlights the Kobo should fetch.
 
-    A CWA book is named when the ETag the device sent differs from
-    `W/"cwa-<kobo_etag_version>"`. Nothing is named unless highlight sync is on and
+    A CWA book is named when its `kobo_etag_version` is above 0 and the ETag the
+    device sent differs from `W/"cwa-<kobo_etag_version>"`. Nothing is named unless highlight sync is on and
     the firmware is one the admin verified. `book_id_for` maps a ContentId to a CWA
     book id, or None for a book CWA doesn't own.
     """
     if not delivers_to(firmware):
         return []
+    # A book CWA never held anything for (version 0) has nothing to send: the
+    # device's own W/"0" is as good as ours.
     lookup = book_id_for or _calibre_book_id
     named = []
     for entry in entries:
@@ -392,7 +475,8 @@ def kobo_changed_books(session, user_id: int, entries: list, firmware: Optional[
         book_id = lookup(content_id)
         if book_id is None:
             continue
-        if entry.get("etag") != kobo_etag(_book_version(session, user_id, book_id)):
+        version = _book_version(session, user_id, book_id)
+        if version and entry.get("etag") != kobo_etag(version):
             named.append(content_id)
     return named
 

@@ -20,6 +20,7 @@ from cps.progress_syncing.highlights.store import (
     Highlight,
     HighlightBookState,
     HighlightDevice,
+    KoboOpaqueAnnotation,
     delete_from_side,
     ensure_highlight_tables,
     live_for_book,
@@ -57,6 +58,7 @@ EXPECTED = {
         "id", "user_id", "book_id", "kobo_etag_version", "kobo_delivered_version",
     },
     "highlight_device": {"id", "user_id", "kobo_firmware", "readest_device_id"},
+    "kobo_opaque_annotation": {"id", "user_id", "book_id", "kobo_id", "raw", "updated_at", "deleted_at"},
 }
 
 
@@ -97,6 +99,7 @@ class TestTables:
         assert ["user_id", "kobo_id"] in _unique_column_sets(conn, "highlight")
         assert ["user_id", "book_id"] in _unique_column_sets(conn, "highlight_book_state")
         assert ["user_id"] in _unique_column_sets(conn, "highlight_device")
+        assert ["user_id", "kobo_id"] in _unique_column_sets(conn, "kobo_opaque_annotation")
 
     def test_orm_models_match_the_ensured_columns(self, session):
         engine_columns = {
@@ -105,6 +108,7 @@ class TestTables:
                 ("highlight", Highlight),
                 ("highlight_book_state", HighlightBookState),
                 ("highlight_device", HighlightDevice),
+                ("kobo_opaque_annotation", KoboOpaqueAnnotation),
             )
         }
         assert engine_columns == EXPECTED
@@ -131,6 +135,7 @@ class TestTables:
         conn.execute("INSERT INTO highlight (user_id, book_id) VALUES (3, 1)")
         conn.execute("INSERT INTO highlight_book_state (user_id, book_id) VALUES (3, 1)")
         conn.execute("INSERT INTO highlight_device (user_id) VALUES (3)")
+        conn.execute("INSERT INTO kobo_opaque_annotation (user_id, book_id, kobo_id, raw) VALUES (3, 1, 'd', '{}')")
         conn.execute("DELETE FROM user WHERE id = 3")
         for table in EXPECTED:
             assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
@@ -399,6 +404,24 @@ class TestSettings:
         assert is_highlight_sync_enabled() is True
         assert highlight_sync_ever_enabled() is True
         assert tested_kobo_firmware() == {"4.1"}
+
+    def test_ever_is_remembered_once_read_as_on(self, tmp_path, monkeypatch):
+        _cwa_db_file(tmp_path, kobo_readest_highlight_sync=1,
+                     kobo_readest_highlight_sync_ever=1, highlight_sync_kobo_firmware="")
+        assert highlight_sync_ever_enabled() is True
+        (tmp_path / "cwa.db").unlink()
+        _fake_cwa_db(monkeypatch, error=RuntimeError("no db"))
+        assert highlight_sync_ever_enabled() is True
+        assert is_highlight_sync_enabled() is False  # only the monotonic flag is remembered
+
+    def test_ever_off_is_not_remembered(self, tmp_path, monkeypatch):
+        _cwa_db_file(tmp_path, kobo_readest_highlight_sync=0,
+                     kobo_readest_highlight_sync_ever=0, highlight_sync_kobo_firmware="")
+        assert highlight_sync_ever_enabled() is False
+        (tmp_path / "cwa.db").unlink()
+        _cwa_db_file(tmp_path, kobo_readest_highlight_sync=1,
+                     kobo_readest_highlight_sync_ever=1, highlight_sync_kobo_firmware="")
+        assert highlight_sync_ever_enabled() is True
 
     def test_fails_closed(self, monkeypatch):
         _fake_cwa_db(monkeypatch, error=RuntimeError("no db"))

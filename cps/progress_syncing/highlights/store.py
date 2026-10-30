@@ -117,6 +117,32 @@ class HighlightDevice(AppBase):
     readest_device_id = Column(String)
 
 
+class KoboOpaqueAnnotation(AppBase):
+    """
+    A Kobo annotation that isn't a highlight CWA can place: a dogear (bookmark),
+    another type, or a highlight without a complete location. Kept verbatim and
+    echoed back in the Kobo's annotation GET, so the device never loses it; never
+    sent to Readest or Readwise.
+
+    Fields:
+        kobo_id: the annotation's Kobo id, unique per user
+        raw: the annotation object exactly as the Kobo sent it, as JSON
+    """
+    __tablename__ = 'kobo_opaque_annotation'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'kobo_id'),
+        Index('ix_kobo_opaque_annotation_user_book', 'user_id', 'book_id'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('user.id', ondelete='CASCADE'), nullable=False)
+    book_id = Column(Integer, nullable=False)
+    kobo_id = Column(String, nullable=False)
+    raw = Column(String, nullable=False)
+    updated_at = Column(DateTime)
+    deleted_at = Column(DateTime)
+
+
 # Columns after the keys, as DDL. They build the CREATE and are re-offered to
 # ALTER ... ADD COLUMN, which is how tables made by an earlier build upgrade.
 _HIGHLIGHT_COLUMNS = (
@@ -134,6 +160,7 @@ _BOOK_STATE_COLUMNS = (
     "kobo_delivered_version INTEGER NOT NULL DEFAULT 0",
 )
 _DEVICE_COLUMNS = ("kobo_firmware TEXT", "readest_device_id TEXT")
+_OPAQUE_COLUMNS = ("raw TEXT NOT NULL DEFAULT '{}'", "updated_at TIMESTAMP", "deleted_at TIMESTAMP")
 
 
 def ensure_highlight_tables(conn):
@@ -162,6 +189,11 @@ def ensure_highlight_tables(conn):
               _BOOK_STATE_COLUMNS, ["UNIQUE (user_id, book_id)", user_fk])
         table("highlight_device", ["user_id INTEGER NOT NULL UNIQUE"],
               _DEVICE_COLUMNS, [user_fk])
+        table("kobo_opaque_annotation",
+              ["user_id INTEGER NOT NULL", "book_id INTEGER NOT NULL", "kobo_id TEXT NOT NULL"],
+              _OPAQUE_COLUMNS, ["UNIQUE (user_id, kobo_id)", user_fk])
+        execute_sql("CREATE INDEX IF NOT EXISTS ix_kobo_opaque_annotation_user_book "
+                    "ON kobo_opaque_annotation (user_id, book_id)")
         conn.commit()
     except Exception as e:
         log.error(f"Could not create highlight tables: {e}")

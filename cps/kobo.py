@@ -1387,7 +1387,7 @@ def _kobo_reading_services_stub():
     stub = readingservices.reading_services_stub_response(p)
     if stub is None:
         return None
-    if kobo_side.highlight_routing_active():
+    if readingservices.highlight_routing_for_request():
         # Highlight sync (on, or ever on) points reading_services_host at CWA for
         # every Kobo: its readingservices views answer checkforchanges and the
         # annotation GET/PATCH, and the rest of the device's reading-services

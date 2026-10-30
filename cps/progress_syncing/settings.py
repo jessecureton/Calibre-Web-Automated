@@ -19,7 +19,7 @@ def _read_row_directly(columns):
     """Read the columns of the settings row with one query. CWA_DB() reconciles the
     whole cwa.db schema each time it is created, which is too heavy for every
     download/sync request."""
-    db_file = os.path.join(os.environ.get("CWA_DB_PATH", "/config"), "cwa.db")
+    db_file = _cwa_db_file()
     con = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=5)
     try:
         return con.execute(f"SELECT {', '.join(columns)} FROM cwa_settings LIMIT 1").fetchone()
@@ -79,12 +79,32 @@ def is_highlight_sync_enabled() -> bool:
         return False
 
 
+# cwa.db paths whose `kobo_readest_highlight_sync_ever` has been read as 1. The flag
+# never goes back to 0, so once seen it is never read again and can't fail.
+_ever_seen = set()
+
+
+def _cwa_db_file() -> str:
+    return os.path.join(os.environ.get("CWA_DB_PATH", "/config"), "cwa.db")
+
+
 def highlight_sync_ever_enabled() -> bool:
     """Return True if highlight sync has ever been saved as on.
 
     It stays on after the setting is turned off, so that highlights already synced
-    keep being served and are not mistaken for deletions.
+    keep being served and are not mistaken for deletions. Once read as on it is
+    remembered for the life of the process.
     """
+    db_file = _cwa_db_file()
+    if db_file in _ever_seen:
+        return True
+    ever = _read_highlight_sync_ever()
+    if ever:
+        _ever_seen.add(db_file)
+    return ever
+
+
+def _read_highlight_sync_ever() -> bool:
     try:
         return _read_setting_directly(("kobo_readest_highlight_sync_ever",))
     except sqlite3.Error:

@@ -6,6 +6,7 @@
 
 """Unit tests for the Kobo side of highlight sync (store <-> Kobo reading services)."""
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from cps.progress_syncing.highlights import kobo_side
 from cps.progress_syncing.highlights.kobo_side import (
     apply_kobo_patch,
     kobo_annotation_set,
+    kobo_patch_error,
     kobo_changed_books,
     parse_kobo_firmware,
     record_kobo_firmware,
@@ -29,6 +31,7 @@ from cps.progress_syncing.highlights.store import (
     Highlight,
     HighlightBookState,
     HighlightDevice,
+    KoboOpaqueAnnotation,
     upsert_from_side,
 )
 from cps.progress_syncing.position_bridge.book import EpubBook
@@ -103,6 +106,19 @@ def annotation(kobo_id=KOBO_ID, text="wife had discovered that t", note=None, mo
     if note:
         entry["noteText"] = note
     return entry
+
+
+DOGEAR_ID = "d0d0d0d0-0000-4000-8000-000000000001"
+
+
+def dogear_entry(progress=0.25):
+    return {
+        "type": "dogear", "id": DOGEAR_ID, "clientLastModifiedUtc": "",
+        "location": {"span": {"chapterFilename": CH2_PATH, "chapterProgress": progress,
+                              "chapterTitle": "Two", "startPath": r"span#kobo\.2\.1", "startChar": 0,
+                              "endPath": r"span#kobo\.2\.1", "endChar": 0}},
+        "futureField": {"kept": [1, 2]},
+    }
 
 
 def ch2_xpointers(books, start_char=4, end_char=30):
@@ -241,18 +257,82 @@ class TestApplyKoboPatch:
         assert row.note == "from the phone"
         assert (row.kobo_start_path, row.kobo_start_char, row.kobo_end_char) == (r"span#kobo\.4\.1", 4, 30)
 
-    def test_dogears_are_not_stored_as_highlights(self, session, files):
-        entry = annotation(text=None)
-        entry["type"] = "dogear"
-        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [entry, annotation(kobo_id="other")]},
+    def test_dogear_is_kept_verbatim_and_echoed(self, session, books, files):
+        dogear = dogear_entry()
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [dogear, annotation(kobo_id="other")]},
                          NOW, files=files)
         assert [r.kobo_id for r in session.query(Highlight).all()] == ["other"]
+        assert session.query(KoboOpaqueAnnotation).one().kobo_id == DOGEAR_ID
+        assert etag_version(session) == 2
+        body, etag = kobo_annotation_set(session, USER, BOOK, books[1], books[0])
+        assert dogear in body["annotations"] and etag == 'W/"cwa-2"'
+        assert [e["id"] for e in body["annotations"]] == ["other", DOGEAR_ID]
 
-    def test_entries_without_an_id_are_skipped(self, session, files):
+    def test_dogear_echo_survives_the_fallback_read(self, session, files):
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [dogear_entry()]}, NOW, files=files)
+        body, _ = kobo_annotation_set(session, USER, BOOK, None, None, translate_missing=False)
+        assert body["annotations"] == [dogear_entry()]
+
+    def test_opaque_edit_and_delete_bump_the_version(self, session, files):
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [dogear_entry()]}, T0, files=files)
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [dogear_entry()]}, NOW, files=files)
+        assert etag_version(session) == 1  # an identical echo changes nothing
+        moved = dogear_entry(progress=0.5)
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [moved]}, NOW, files=files)
+        assert json.loads(session.query(KoboOpaqueAnnotation).one().raw) == moved
+        assert etag_version(session) == 2
+        apply_kobo_patch(session, USER, BOOK, {"deletedAnnotationIds": [DOGEAR_ID]}, NOW, files=files)
+        assert session.query(KoboOpaqueAnnotation).one().deleted_at is not None
+        assert etag_version(session) == 3
+        body, _ = kobo_annotation_set(session, USER, BOOK, None, None)
+        assert body["annotations"] == []
+
+    def test_highlight_without_a_complete_location_is_kept_verbatim(self, session, books, files):
         entry = annotation()
-        del entry["id"]
+        del entry["location"]["span"]["endPath"]
         apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [entry]}, NOW, files=files)
         assert session.query(Highlight).count() == 0
+        body, _ = kobo_annotation_set(session, USER, BOOK, books[1], books[0])
+        assert body["annotations"] == [entry]
+
+    def test_edit_without_location_keeps_the_stored_range(self, session, files):
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [annotation()]}, T0, files=files)
+        entry = annotation(note="later", modified="2026-10-30T12:30:00Z")
+        del entry["location"]
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [entry]}, NOW, files=files)
+        row = session.query(Highlight).one()
+        assert row.note == "later" and row.kobo_start_path == r"span#kobo\.4\.1" and row.xp0
+        assert session.query(KoboOpaqueAnnotation).count() == 0
+
+    def test_opaque_that_becomes_a_highlight_is_served_once(self, session, books, files):
+        entry = annotation()
+        del entry["location"]
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [entry]}, T0, files=files)
+        apply_kobo_patch(session, USER, BOOK, {"updatedAnnotations": [annotation()]}, NOW, files=files)
+        body, _ = kobo_annotation_set(session, USER, BOOK, books[1], books[0])
+        assert [e["id"] for e in body["annotations"]] == [KOBO_ID]
+        assert body["annotations"][0]["location"]["span"]["startChar"] == 4
+
+    @pytest.mark.parametrize("body", [
+        [annotation()],
+        "text",
+        {"updatedAnnotations": annotation()},
+        {"updatedAnnotations": [annotation(), "junk"]},
+        {"updatedAnnotations": [{k: v for k, v in annotation().items() if k != "id"}]},
+        {"updatedAnnotations": [annotation(kobo_id="")]},
+        {"deletedAnnotationIds": "abc"},
+        {"deletedAnnotationIds": [KOBO_ID, 7]},
+    ])
+    def test_unfit_bodies_are_rejected_whole(self, session, files, body):
+        assert kobo_patch_error(body)
+        with pytest.raises(ValueError):
+            apply_kobo_patch(session, USER, BOOK, body, NOW, files=files)
+        assert session.query(Highlight).count() == 0
+
+    def test_fit_bodies(self):
+        assert kobo_patch_error({}) is None
+        assert kobo_patch_error({"updatedAnnotations": None, "deletedAnnotationIds": []}) is None
+        assert kobo_patch_error({"updatedAnnotations": [dogear_entry()], "deletedAnnotationIds": ["x"]}) is None
 
 
 @pytest.mark.unit
@@ -361,10 +441,23 @@ class TestChangedBooks:
 
     def test_names_book_only_when_etag_differs(self, session, files, flags):
         lookup = self._setup(session, files)
-        entries = [{"ContentId": UUID_A, "etag": 'W/"0"'}, {"ContentId": UUID_B, "etag": 'W/"cwa-0"'}]
+        apply_kobo_patch(session, USER, OTHER_BOOK, {"updatedAnnotations": [annotation(kobo_id="b")]},
+                         NOW, files=files)
+        entries = [{"ContentId": UUID_A, "etag": 'W/"0"'}, {"ContentId": UUID_B, "etag": 'W/"cwa-1"'}]
         assert kobo_changed_books(session, USER, entries, FIRMWARE, book_id_for=lookup) == [UUID_A]
         entries = [{"ContentId": UUID_A, "etag": 'W/"cwa-1"'}, {"ContentId": UUID_B, "etag": 'W/"0"'}]
         assert kobo_changed_books(session, USER, entries, FIRMWARE, book_id_for=lookup) == [UUID_B]
+
+    def test_first_sync_names_only_books_with_cwa_content(self, session, files, flags):
+        lookup = self._setup(session, files)  # BOOK has a highlight; OTHER_BOOK has never had any
+        entries = [{"ContentId": UUID_A, "etag": 'W/"0"'}, {"ContentId": UUID_B, "etag": 'W/"0"'}]
+        assert kobo_changed_books(session, USER, entries, FIRMWARE, book_id_for=lookup) == [UUID_A]
+
+    def test_version_zero_is_never_named_whatever_the_etag(self, session, files, flags):
+        lookup = self._setup(session, files)
+        for etag in ('W/"0"', 'W/"cwa-pending"', 'W/"something-else"', None):
+            entries = [{"ContentId": UUID_B, "etag": etag}]
+            assert kobo_changed_books(session, USER, entries, FIRMWARE, book_id_for=lookup) == []
 
     def test_pending_etag_is_named_again(self, session, files, flags):
         lookup = self._setup(session, files)
