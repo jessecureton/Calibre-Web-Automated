@@ -24,7 +24,7 @@ from cps.progress_syncing.highlights.ranges import (
 from cps.progress_syncing.position_bridge.book import EpubBook
 from cps.progress_syncing.position_bridge.xpointer import parse_xpointer
 
-from .position_bridge_books import CH1, CH2, kepubify_like, write_book
+from .position_bridge_books import CH1, CH2, HEAD, kepubify_like, write_book
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "..", "fixtures", "position_bridge")
 AK_EPUB = os.path.join(FIXTURES, "anna-karenina.epub")
@@ -179,6 +179,32 @@ class TestSyntheticRanges:
         assert xpointers_to_kobo_range(
             epub, kepub, "/body/DocFragment[9]/body/p/text().0",
             "/body/DocFragment[9]/body/p/text().4") is None
+
+    def test_identical_passage_elsewhere_is_not_misplaced(self, tmp_path):
+        # The same paragraph twice, with ~2.6 KB of EPUB text before both copies that
+        # the KEPUB lacks (kepubify leaves it without spans), so proportional
+        # placement points each side at the wrong copy of the other.
+        # Each copy is followed by the same 40+ characters, so both ends' windows match twice.
+        para = "The lamp on the table flickered while the clock in the hall struck nine."
+        after = "Somewhere outside a dog barked twice and then the night was quiet again."
+        chapter = HEAD + (
+            f"<p>Intro.</p><div>{'Filler words without any spans at all. ' * 66}</div>"
+            f"<p>{para}</p><p>{after}</p><p>{para}</p><p>{after}</p></body></html>"
+        )
+        epub = EpubBook(write_book(tmp_path / "d.epub", {"ch1.xhtml": CH1, "ch2.xhtml": chapter}))
+        kepub = EpubBook(write_book(tmp_path / "d.kepub", {
+            "ch1.xhtml": kepubify_like(CH1), "ch2.xhtml": kepubify_like(chapter),
+        }))
+        assert len(epub.chapter_text(CH2_PATH).text) - len(kepub.span_stream(CH2_PATH).text) > 2500
+        stream = kepub.span_stream(CH2_PATH)
+        second = KoboRange(CH2_PATH, r"span#kobo\.4\.1", 0, r"span#kobo\.4\.1", len(para),
+                           stream.offset_of("kobo.4.1") / len(stream.text))
+        xps = kobo_range_to_xpointers(epub, kepub, second)
+        assert xps is None or xps[0] == "/body/DocFragment[2]/body/p[4]/text().0", xps
+        first_copy = ("/body/DocFragment[2]/body/p[2]/text().0",
+                      f"/body/DocFragment[2]/body/p[2]/text().{len(para)}")
+        r = xpointers_to_kobo_range(epub, kepub, *first_copy)
+        assert r is None or r.start_path == r"span#kobo\.2\.1", r
 
     def test_different_text_on_the_other_side_is_untranslatable(self, tmp_path):
         # The EPUB has a word the KEPUB lacks inside the highlighted passage.

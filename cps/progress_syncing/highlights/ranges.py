@@ -17,7 +17,9 @@ the first character, the end by the last.
 
 A range is only translated when both ends land in the same chapter, in order,
 and the text between them is the same on both sides once whitespace is
-ignored. Anything else returns None: better undelivered than misplaced.
+ignored, and is the same occurrence of that text (the k-th copy on one side is
+the k-th on the other). Anything else returns None: better undelivered than
+misplaced.
 """
 
 import bisect
@@ -77,9 +79,27 @@ def _squeeze(text: str) -> str:
     return ''.join(ch for ch in text if not ch.isspace())
 
 
-def _same_text(a: str, b: str) -> bool:
-    squeezed = _squeeze(a)
-    return bool(squeezed) and squeezed == _squeeze(b)
+def _occurrences_before(haystack: str, needle: str, index: int) -> int:
+    """How many (possibly overlapping) occurrences of needle start before index."""
+    count, hit = 0, haystack.find(needle)
+    while hit != -1 and hit < index:
+        count += 1
+        hit = haystack.find(needle, hit + 1)
+    return count
+
+
+def _same_passage(source, start: int, end: int, target, t_start: int, t_end: int) -> bool:
+    """Whether target[t_start:t_end] is the same passage as source[start:end].
+
+    The text must match ignoring whitespace, and be the same occurrence of it: a
+    passage repeated in the chapter can carry, both ends together, to the wrong copy.
+    """
+    needle = _squeeze(source.text[start:end])
+    if not needle or needle != _squeeze(target.text[t_start:t_end]):
+        return False
+    src, dst = _squeezed(source), _squeezed(target)
+    return (_occurrences_before(src.text, needle, src.at(start))
+            == _occurrences_before(dst.text, needle, dst.at(t_start)))
 
 
 def _span_length(stream: SpanStream, span_id: str) -> Optional[int]:
@@ -148,7 +168,7 @@ def kobo_range_to_xpointers(epub: EpubBook, kepub: EpubBook, r: KoboRange) -> Op
     c_end = _carry_end(stream, end, chapter)
     if c_start is None or c_end is None or c_end <= c_start:
         return None
-    if not _same_text(stream.text[start:end], chapter.text[c_start:c_end]):
+    if not _same_passage(stream, start, end, chapter, c_start, c_end):
         return None
     return chapter.xpointer_at(fragment, c_start), _end_xpointer(chapter, fragment, c_end)
 
@@ -176,7 +196,7 @@ def xpointers_to_kobo_range(epub: EpubBook, kepub: EpubBook, xp0: str, xp1: str)
     k_end = _carry_end(chapter, end, stream)
     if k_start is None or k_end is None or k_end <= k_start:
         return None
-    if not _same_text(chapter.text[start:end], stream.text[k_start:k_end]):
+    if not _same_passage(chapter, start, end, stream, k_start, k_end):
         return None
     return _kobo_range(kepub_path, stream, k_start, k_end)
 
