@@ -52,10 +52,10 @@ What CWA adds on top:
   doesn't list (the add landed on a Readest tombstone of the same position,
   which stays deleted: useBookOrbitNotesSync.ts:139-147) is dropped and the
   highlight left undelivered and logged, never deleted.
-- Mass deletions are held: if one complete key list drops at least 4 of a
-  book's live Readest-known highlights, and that is all or more than half of
-  them, nothing is deleted, the counts are logged and the highlights are marked
-  held. The exchange is still answered normally (no deletes, and no edits for
+- Mass deletions are held: if one complete key list drops all of a book's
+  live Readest-known highlights (at least 2), or more than half of them when
+  there are more than 3, nothing is deleted, the counts are logged and the
+  highlights are marked held. A single deletion always goes through. The exchange is still answered normally (no deletes, and no edits for
   keys Readest didn't list), so Readest's pass completes and doesn't repeat.
   The hold is sticky: held highlights are left out of later deletion counts
   until their keys reappear (which lifts the hold) or an admin releases them
@@ -155,8 +155,14 @@ def _error(status: int, message: str):
 
 
 def _is_mass_deletion(missing: int, known: int) -> bool:
-    """At least 4 deletions in one pass that are all, or more than half, of the book's highlights."""
-    return missing >= 4 and missing * 2 > known
+    """
+    A pass's deletions of a book's live Readest-known highlights that are held: all
+    of them when there are at least 2, or more than half of them when there are
+    more than 3. A single deletion always goes through.
+    """
+    if missing <= 1:
+        return False
+    return (missing >= known and known >= 2) or (known > 3 and missing * 2 > known)
 
 
 # --- request gate -----------------------------------------------------------------

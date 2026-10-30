@@ -573,14 +573,40 @@ def test_half_is_applied(readest, session):
     assert sum(r.deleted_at is not None for r in rows(session)) == 4   # 4 of 8: applied
 
 
-def test_small_deletions_always_propagate(readest, session):
-    # Ruling A: fewer than 4 deletions in a pass are never held, even all of a book's.
-    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 5)]  # 3
+@pytest.mark.parametrize("count", [2, 3])
+def test_deleting_all_of_a_books_highlights_is_held_from_two(readest, session, count):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 2 + count)]
     readest.run_pass()
     for nid in ids:
         readest.delete(nid)
     assert readest.run_pass()["toApply"] == {"add": [], "edit": [], "delete": []}
-    assert all(r.deleted_at is not None for r in rows(session))
+    assert all(r.deleted_at is None and r.readest_held for r in rows(session))
+
+
+def test_a_single_deletion_always_propagates(readest, session):
+    [nid] = [readest.highlight(xp(2, 0), xp(2, 9), "the only passage")]
+    readest.run_pass()
+    readest.delete(nid)
+    readest.run_pass()
+    [row] = rows(session)
+    assert row.deleted_at is not None and not row.readest_held
+
+
+@pytest.mark.parametrize("total,deleted,held", [
+    (4, 3, True),    # more than half of more than 3
+    (5, 3, True),
+    (3, 2, False),   # not all, and not more than 3
+    (4, 2, False),   # half
+    (6, 3, False),
+])
+def test_more_than_half_of_more_than_three_is_held(readest, session, total, deleted, held):
+    ids = [readest.highlight(xp(n, 0), xp(n, 9), f"passage {n}") for n in range(2, 2 + total)]
+    readest.run_pass()
+    for nid in ids[:deleted]:
+        readest.delete(nid)
+    readest.run_pass()
+    gone = sum(r.deleted_at is not None for r in rows(session))
+    assert (gone, sum(r.readest_held for r in rows(session))) == ((0, deleted) if held else (deleted, 0))
 
 
 def test_held_deletion_is_sticky(readest, session):
