@@ -105,6 +105,12 @@ def record_kobo_firmware(session, user_id: int, user_agent: Optional[str]) -> Op
     return firmware
 
 
+def stored_kobo_firmware(session, user_id: int) -> Optional[str]:
+    """The firmware last recorded for the user's Kobo, or None."""
+    device = session.query(HighlightDevice).filter_by(user_id=user_id).first()
+    return device.kobo_firmware if device and device.kobo_firmware else None
+
+
 def kobo_etag(version: int, pending: bool = False) -> str:
     """The annotation ETag CWA gives the Kobo; a pending one is never current, so the book is named again."""
     return f'W/"cwa-{version}-pending"' if pending else f'W/"cwa-{version}"'

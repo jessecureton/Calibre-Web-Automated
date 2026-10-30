@@ -15,7 +15,6 @@ These routes are at the root level: /api/v3/..., /api/UserStorage/...
 
 import json
 import os
-import time
 import zipfile
 import re
 from datetime import datetime, timezone
@@ -225,9 +224,14 @@ def _rollback(session=None):
 
 
 def _record_firmware(user_id):
-    """Remember the Kobo's firmware; never lets a failure reach the request."""
+    """Remember the Kobo's firmware; never lets a failure reach the request.
+
+    A User-Agent without the firmware falls back to the one stored for the user.
+    """
     try:
         firmware = kobo_side.record_kobo_firmware(ub.session, user_id, request.headers.get("User-Agent"))
+        if firmware is None:
+            firmware = kobo_side.stored_kobo_firmware(ub.session, user_id)
         ub.session.commit()
         return firmware
     except Exception as e:
@@ -293,7 +297,9 @@ def _highlight_annotations_get(user_id, book_id, firmware):
 def _stored_annotation_set(user_id, book_id):
     """Every live highlight with a stored Kobo range: the set the device already holds.
 
-    Tried on the request's session, then on fresh sessions with short waits. Writes nothing.
+    Tried on the request's session, then on fresh sessions, with short waits that
+    yield to other requests (never time.sleep, which would hold up the gevent server).
+    Writes nothing.
     """
     try:
         body, _ = kobo_side.kobo_annotation_set(ub.session, user_id, book_id, None, None,
@@ -304,8 +310,7 @@ def _stored_annotation_set(user_id, book_id):
                     f"on the request session ({type(e).__name__})")
         _rollback()
     for delay in _FALLBACK_RETRY_DELAYS:
-        if delay:
-            time.sleep(delay)
+        _pause(delay)
         session = None
         try:
             session = Session(bind=ub.session.get_bind())
@@ -324,6 +329,18 @@ def _stored_annotation_set(user_id, book_id):
     log.error(f"[highlight-sync] user={user_id} book={book_id}: no highlight set could be read; "
               f"the Kobo will drop this book's highlights")
     return {"annotations": [], "nextPageOffsetToken": None}
+
+
+def _pause(seconds):
+    """Wait cooperatively under gevent; without gevent, don't wait (the retry runs at once)."""
+    if not seconds:
+        return
+    try:
+        import gevent
+    except ImportError:
+        return
+    if gevent is not None:
+        gevent.sleep(seconds)
 
 
 def _count(value):

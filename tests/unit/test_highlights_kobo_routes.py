@@ -398,6 +398,30 @@ class TestGet:
         r = client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
         assert r.status_code == 200 and [e["id"] for e in r.get_json()["annotations"]] == [KOBO_ID]
 
+    @pytest.mark.parametrize("with_gevent", [True, False])
+    def test_fallback_retries_never_block_the_worker(self, client, session, monkeypatch, with_gevent):
+        import time as time_module
+        client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        real = kobo_side.kobo_annotation_set
+        calls = []
+
+        def flaky(s, *a, **k):
+            calls.append(s)
+            if len(calls) < 4:      # the full build, the request session, then the first fresh session
+                raise RuntimeError("database is locked")
+            return real(s, *a, **k)
+
+        def blocking(seconds):
+            raise AssertionError("time.sleep blocks every request on the gevent server")
+        monkeypatch.setattr(kobo_side, "kobo_annotation_set", flaky)
+        monkeypatch.setattr(time_module, "sleep", blocking)
+        cooperative = []
+        monkeypatch.setitem(sys.modules, "gevent",
+                            SimpleNamespace(sleep=cooperative.append) if with_gevent else None)
+        r = client.get(f"/api/v3/content/{UUID}/annotations", headers=HEADERS)
+        assert r.status_code == 200 and [e["id"] for e in r.get_json()["annotations"]] == [KOBO_ID]
+        assert cooperative == ([0.5] if with_gevent else [])
+
     def test_total_failure_still_answers_200(self, client, session, monkeypatch):
         def boom(*a, **k):
             raise RuntimeError("no database")
@@ -522,6 +546,17 @@ class TestCheckForChanges:
         session.query(HighlightDevice).one().kobo_import_done = True
         session.commit()
         assert client.post("/api/v3/content/checkforchanges", json=batch, headers=HEADERS).get_json() == [UUID]
+
+    def test_firmware_falls_back_to_the_stored_one_when_the_user_agent_lacks_it(self, client, session,
+                                                                               monkeypatch):
+        client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        assert session.query(HighlightDevice).one().kobo_firmware == FIRMWARE
+        no_proxy(monkeypatch)
+        batch = [{"ContentId": UUID, "etag": 'W/"0"'}]
+        r = client.post("/api/v3/content/checkforchanges", json=batch,
+                        headers={**HEADERS, "User-Agent": "Mozilla/5.0 (Linux; U; Android 2.0)"})
+        assert r.get_json() == [UUID]
+        assert session.query(HighlightDevice).one().kobo_firmware == FIRMWARE
 
     def test_a_book_whose_patch_failed_is_not_named_until_a_patch_succeeds(self, client, session, monkeypatch):
         """Named after a failed PATCH, the Kobo's GET would delete the highlights that PATCH carried."""
