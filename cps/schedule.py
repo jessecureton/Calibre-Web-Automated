@@ -319,14 +319,12 @@ def _schedule_hardcover_auto_fetch(scheduler, timezone_info):
 
 
 def _schedule_readwise_highlights(scheduler, timezone_info):
-    """Every 5 minutes, send changed highlights to Readwise. Registered only when
-    Kobo <-> Readest highlight sync is on."""
+    """Every 5 minutes, send changed highlights to Readwise. Always registered: the
+    task does nothing while Kobo <-> Readest highlight sync is off, so turning the
+    setting on needs no restart."""
     try:
-        from .progress_syncing import settings
         from .tasks.readwise_highlights import TaskReadwiseHighlights
 
-        if not settings.is_highlight_sync_enabled():
-            return
         scheduler.schedule_task(lambda: TaskReadwiseHighlights(), user='System',
                                 trigger=IntervalTrigger(minutes=5, timezone=timezone_info),
                                 name='readwise highlights', hidden=True)

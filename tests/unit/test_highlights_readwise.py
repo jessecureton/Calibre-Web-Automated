@@ -315,6 +315,29 @@ def test_backfill_with_no_matching_readwise_book_still_marks_done(session, user,
     assert session.query(HighlightBookState).filter_by(book_id=BOOK).one().readwise_backfill_done is True
 
 
+@pytest.mark.parametrize("title,author", [
+    ("The Test Book: A Subtitle", "Bob Writer, Ann Author"),
+    ("the test book", "Ann Author and Bob Writer"),
+    ("The Test Book", "Ann Author, Bob Writer"),
+])
+def test_backfill_matches_by_main_title_and_author_words(session, user, http, title, author):
+    add(session, "k1", "Already there")
+    http.routes[("get", "/api/v2/books/")] = FakeResponse(200, {"count": 1, "next": None, "results": [
+        {"id": 777, "title": title, "author": author}]})
+    http.routes[("get", "/api/v2/export/")] = FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
+        {"user_book_id": 777, "highlights": [{"id": 1, "text": "already  THERE"}]}]})
+    assert backfill_skip_existing(session, user, http, book_info=lookup) == 1
+
+
+def test_backfill_does_not_match_another_author(session, user, http):
+    add(session, "k1", "Already there")
+    http.routes[("get", "/api/v2/books/")] = FakeResponse(200, {"count": 1, "next": None, "results": [
+        {"id": 777, "title": "The Test Book: A Subtitle", "author": "Ann Author"}]})
+    http.routes[("get", "/api/v2/export/")] = FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
+        {"user_book_id": 777, "highlights": [{"id": 1, "text": "Already there"}]}]})
+    assert backfill_skip_existing(session, user, http, book_info=lookup) == 0
+
+
 def test_failed_backfill_pushes_nothing_for_that_book(session, user, http):
     row = add(session, "k1", "x")
     http.routes[("get", "/api/v2/books/")] = FakeResponse(500, None)
@@ -522,7 +545,8 @@ def test_token_never_logged(session, user, http, caplog):
         assert text not in caplog.text
 
 
-def test_schedule_registers_job_only_when_enabled(monkeypatch):
+def test_schedule_registers_job_whatever_the_setting(monkeypatch):
+    """The task itself does nothing while the setting is off, so turning it on needs no restart."""
     from cps import schedule
     from cps.progress_syncing import settings
 
@@ -533,17 +557,13 @@ def test_schedule_registers_job_only_when_enabled(monkeypatch):
         def schedule_task(self, task, user=None, name=None, hidden=False, trigger=None):
             self.jobs.append((task, name, hidden, trigger))
 
-    monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: False)
-    off = FakeScheduler()
-    schedule._schedule_readwise_highlights(off, timezone.utc)
-    assert off.jobs == []
-
-    monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: True)
-    on = FakeScheduler()
-    schedule._schedule_readwise_highlights(on, timezone.utc)
-    (task, name, hidden, trigger), = on.jobs
-    assert name == "readwise highlights" and trigger.interval == timedelta(minutes=5)
-    assert task().name == "Readwise highlights"
+    for enabled in (False, True):
+        monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: enabled)
+        scheduler = FakeScheduler()
+        schedule._schedule_readwise_highlights(scheduler, timezone.utc)
+        (task, name, hidden, trigger), = scheduler.jobs
+        assert name == "readwise highlights" and trigger.interval == timedelta(minutes=5)
+        assert task().name == "Readwise highlights"
 
 
 def bump(session, row_id, **extra):

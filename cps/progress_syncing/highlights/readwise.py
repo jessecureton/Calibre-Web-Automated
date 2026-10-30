@@ -38,6 +38,7 @@ Environment: `READWISE_API_BASE` (default `https://readwise.io`).
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import NamedTuple, Optional
 
@@ -264,8 +265,25 @@ def _export_highlights(http, token, book_ids):
     return None
 
 
+def _words(text) -> str:
+    """Lower-case words with accents, punctuation and spacing dropped."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    plain = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", plain.casefold()).split())
+
+
+def _main_title(title) -> str:
+    """The title without a subtitle (after the first ':')."""
+    return _words((title or "").split(":", 1)[0])
+
+
+def _author_words(author) -> frozenset:
+    """The words of an author list, in any order and however it is joined."""
+    return frozenset(_words(author).split()) - {"and"}
+
+
 def _readwise_books(http, token):
-    """(id, normalized title, normalized author) of the account's `books` category, or None."""
+    """(id, main title, author words) of the account's `books` category, or None."""
     books = []
     url, params = f"{_api_base()}/api/v2/books/", {"category": "books", "page_size": 1000}
     for _ in range(MAX_PAGES):
@@ -275,7 +293,7 @@ def _readwise_books(http, token):
             log.warning(f"Readwise books list answered {response.status_code}")
             return None
         for item in body.get("results") or []:
-            books.append((item.get("id"), _normalize(item.get("title")), _normalize(item.get("author"))))
+            books.append((item.get("id"), _main_title(item.get("title")), _author_words(item.get("author"))))
         url, params = body.get("next"), None
         if not url:
             break
@@ -319,7 +337,9 @@ def backfill_skip_existing(session, user, http=requests, book_info=None) -> int:
     holds (equal text after casefolding and collapsing whitespace) as not dirty, leaving
     `readwise_id` NULL. Returns how many were skipped.
 
-    The Readwise book is found by title and author in the account's books list. A book is
+    The Readwise book is found in the account's books list by its main title (a subtitle
+    after ':' left out) and the set of its authors' words, so order and punctuation don't
+    matter. A book is
     marked done only when Readwise answered; on any failure it stays undone and is not
     pushed (`push_dirty` skips it), so nothing is doubled.
     """
@@ -342,7 +362,7 @@ def backfill_skip_existing(session, user, http=requests, book_info=None) -> int:
                 readwise_books = _readwise_books(http, token)
                 if readwise_books is None:
                     return skipped
-            wanted = (_normalize(info.title), _normalize(info.author))
+            wanted = (_main_title(info.title), _author_words(info.author))
             matches = [rid for rid, title, author in readwise_books if (title, author) == wanted]
             existing = set()
             if matches:
