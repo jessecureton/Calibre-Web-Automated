@@ -64,6 +64,9 @@ class Highlight(AppBase):
             not offered again until the version moves
         version: bumped on every applied change
         readwise_id, readwise_dirty: Readwise export bookkeeping
+        readwise_error: short reason (e.g. "http 400") Readwise refused this version of the
+            highlight; it is then not dirty and is left alone until its next change, which
+            clears the error
     """
     __tablename__ = 'highlight'
     __table_args__ = (
@@ -101,6 +104,7 @@ class Highlight(AppBase):
     version = Column(Integer, nullable=False, default=1, server_default='1')
     readwise_id = Column(String)
     readwise_dirty = Column(Boolean, nullable=False, default=False, server_default='0')
+    readwise_error = Column(String)
 
     def __repr__(self):
         return f'<Highlight user={self.user_id} book={self.book_id} id={self.id}>'
@@ -177,7 +181,7 @@ _HIGHLIGHT_COLUMNS = (
     "readest_version INTEGER", "readest_failed_version INTEGER",
     "readest_seen BOOLEAN NOT NULL DEFAULT 0", "readest_held BOOLEAN NOT NULL DEFAULT 0",
     "version INTEGER NOT NULL DEFAULT 1",
-    "readwise_id TEXT", "readwise_dirty BOOLEAN NOT NULL DEFAULT 0",
+    "readwise_id TEXT", "readwise_dirty BOOLEAN NOT NULL DEFAULT 0", "readwise_error TEXT",
 )
 _BOOK_STATE_COLUMNS = (
     "kobo_etag_version INTEGER NOT NULL DEFAULT 0",
@@ -293,6 +297,7 @@ def _changed(session, row: Highlight) -> None:
     """Record an applied change to an existing row."""
     row.version = (row.version or 1) + 1
     row.readwise_dirty = True
+    row.readwise_error = None
     _bump_book(session, row.user_id, row.book_id)
 
 

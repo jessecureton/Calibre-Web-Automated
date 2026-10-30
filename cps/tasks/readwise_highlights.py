@@ -13,6 +13,19 @@ from cps.progress_syncing.highlights import readwise
 from cps.services.worker import CalibreTask
 
 
+# One app-db engine for every run (get_new_session_instance builds a new engine each call,
+# and this job runs every 5 minutes). It is a scoped_session: each run's thread gets its own
+# session and releases it with `remove()`.
+_app_db_session = None
+
+
+def _shared_session():
+    global _app_db_session
+    if _app_db_session is None:
+        _app_db_session = ub.get_new_session_instance()
+    return _app_db_session
+
+
 class TaskReadwiseHighlights(CalibreTask):
     """Copy every user's dirty highlights to their Readwise account (the outbox)."""
 
@@ -25,15 +38,29 @@ class TaskReadwiseHighlights(CalibreTask):
         if not settings.is_highlight_sync_enabled():
             self._handleSuccess()
             return
-        app_db_session = ub.get_new_session_instance()
+        app_db_session = _shared_session()
         calibre = db.CalibreDB(expire_on_commit=False, init=True)
         try:
             lookup = lambda book_id: readwise.book_info_from(calibre, book_id)  # noqa: E731
             users = app_db_session.query(ub.User).filter(
                 ub.User.readwise_token.isnot(None), ub.User.readwise_token != "").all()
-            for user in users:
-                readwise.push_dirty(app_db_session, user, book_info=lookup)
-            self._handleSuccess()
+            user_ids = [user.id for user in users]
+            failed = []
+            for user_id in user_ids:
+                # One user's failure must not stop the others' pushes.
+                try:
+                    user = app_db_session.query(ub.User).filter(ub.User.id == user_id).first()
+                    if user is not None:
+                        readwise.push_dirty(app_db_session, user, book_info=lookup)
+                except Exception as e:
+                    app_db_session.rollback()
+                    # Class name only: an exception's text can carry highlight text or a URL.
+                    self.log.error(f"Readwise outbox failed for user {user_id}: {type(e).__name__}")
+                    failed.append(user_id)
+            if failed:
+                self._handleError(f"Readwise outbox failed for {len(failed)} user(s)")
+            else:
+                self._handleSuccess()
         except Exception as e:
             app_db_session.rollback()
             # Class name only: an exception's text can carry highlight text or a URL.

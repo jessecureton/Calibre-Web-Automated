@@ -59,6 +59,7 @@ class FakeHttp:
         self.calls = []
         self.routes = {}
         self.next_id = 9000
+        self.created = []  # what Readwise holds because of our POSTs, as the export lists it
 
     def _do(self, method, url, headers=None, json=None, params=None, timeout=None):
         path = url.split("://", 1)[1].split("/", 1)[1]
@@ -73,15 +74,20 @@ class FakeHttp:
         if method == "post" and path == "/api/v2/highlights/":
             def create(call):
                 ids = []
-                for _ in call["json"]["highlights"]:
+                for item in call["json"]["highlights"]:
                     self.next_id += 1
                     ids.append(self.next_id)
+                    self.created.append({"id": self.next_id, "text": item["text"],
+                                         "url": item["highlight_url"]})
                 return FakeResponse(200, [{"id": 555, "title": "T", "modified_highlights": ids}])
             return create
         if method == "patch":
             return FakeResponse(200, {"id": 1})
         if method == "delete":
             return FakeResponse(204)
+        if method == "get" and path == "/api/v2/export/":
+            return lambda call: FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
+                {"user_book_id": 555, "highlights": list(self.created)}]})
         return FakeResponse(200, {"count": 0, "next": None, "nextPageCursor": None, "results": []})
 
     def get(self, url, **kw):
@@ -167,7 +173,7 @@ def test_new_highlight_posted_with_locator_and_id_stored(session, user, http):
     session.refresh(row)
     assert row.readwise_id == "9001" and row.readwise_dirty is False
     assert (result.created, result.failed, result.rate_limited) == (1, 0, False)
-    assert not http.of("get")  # a lone create needs no export to learn its id
+    assert len(http.of("get", "/api/v2/export/")) == 1  # ownership is checked, even for a lone create
 
 
 def test_location_is_position_in_book_not_creation_order(session, user, http):
@@ -278,8 +284,9 @@ def test_push_runs_backfill_first_and_only_once_per_book(session, user, http):
     add(session, "k2", "New passage", xp0=xp(2, 2))
     http.routes[("get", "/api/v2/books/")] = FakeResponse(200, {"count": 1, "next": None, "results": [
         {"id": 42, "title": "The Test Book", "author": "Ann Author, Bob Writer"}]})
-    http.routes[("get", "/api/v2/export/")] = FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
-        {"user_book_id": 42, "highlights": [{"id": 8, "text": "same passage"}]}]})
+    http.routes[("get", "/api/v2/export/")] = lambda call: FakeResponse(200, {
+        "count": 1, "nextPageCursor": None, "results": [
+            {"user_book_id": 42, "highlights": [{"id": 8, "text": "same passage"}] + http.created}]})
     result = push_dirty(session, user, http, book_info=lookup)
     (post,) = http.of("post")
     assert [h["text"] for h in post["json"]["highlights"]] == ["New passage"]
@@ -291,7 +298,7 @@ def test_push_runs_backfill_first_and_only_once_per_book(session, user, http):
     add(session, "k3", "Later one", xp0=xp(2, 3))
     http.calls.clear()
     push_dirty(session, user, http, book_info=lookup)
-    assert not http.of("get")
+    assert not http.of("get", "/api/v2/books/")  # no backfill listing again (the create's export is separate)
     assert len(http.of("post")) == 1
 
 
@@ -435,12 +442,21 @@ def test_post_deduped_by_readwise_keeps_no_id(session, user, http):
 def test_unresolved_id_stays_dirty_and_is_reposted_idempotently(session, user, http):
     mark_done(session)
     row = add(session, "k1", "x")
-    add(session, "k2", "y", xp0=xp(2, 2))
-    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [1, 2]}])
+    other = add(session, "k2", "y", xp0=xp(2, 2))
     http.routes[("get", "/api/v2/export/")] = FakeResponse(500, None)
     push_dirty(session, user, http, book_info=lookup)
     session.refresh(row)
     assert row.readwise_dirty is True and row.readwise_id is None
+    first = sorted(h["highlight_url"] for h in http.of("post")[0]["json"]["highlights"])
+
+    http.routes.pop(("get", "/api/v2/export/"))  # the export works again
+    http.calls.clear()
+    push_dirty(session, user, http, book_info=lookup)
+    second = sorted(h["highlight_url"] for h in http.of("post")[0]["json"]["highlights"])
+    assert second == first == sorted(f"cwa://{UUID}/highlight/{r.id}" for r in (row, other))
+    for r in (row, other):
+        session.refresh(r)
+        assert r.readwise_dirty is False and r.readwise_id is not None
 
 
 def test_empty_text_is_not_sent(session, user, http):
@@ -524,45 +540,243 @@ def test_schedule_registers_job_only_when_enabled(monkeypatch):
     assert task().name == "Readwise highlights"
 
 
-def test_task_pushes_each_user_with_a_token_and_respects_the_setting(monkeypatch):
+def bump(session, row_id, **extra):
+    """A Kobo/Readest change landing while a request is in flight."""
+    row = session.get(Highlight, row_id)
+    row.version += 1
+    row.readwise_dirty = True
+    row.note = "changed meanwhile"
+    for name, value in extra.items():
+        setattr(row, name, value)
+    session.commit()
+
+
+def test_edit_during_create_round_trip_stays_dirty_but_id_recorded(session, user, http):
+    mark_done(session)
+    row = add(session, "k1", "x")
+    default_post = http.default("post", "/api/v2/highlights/", None)
+
+    def post(call):
+        response = default_post(call)
+        bump(session, row.id)
+        return response
+    http.routes[("post", "/api/v2/highlights/")] = post
+    push_dirty(session, user, http, book_info=lookup)
+    session.refresh(row)
+    assert row.readwise_dirty is True and row.readwise_id == "9001" and row.note == "changed meanwhile"
+
+    # the next run sends the newer content as an edit
+    http.calls.clear()
+    push_dirty(session, user, http, book_info=lookup)
+    (patch,) = http.of("patch")
+    assert patch["path"] == "/api/v2/highlights/9001/" and patch["json"]["note"] == "changed meanwhile"
+    session.refresh(row)
+    assert row.readwise_dirty is False
+
+
+def test_edit_during_patch_round_trip_stays_dirty(session, user, http):
+    mark_done(session)
+    row = add(session, "k1", "x")
+    row.readwise_id = "7001"
+    session.commit()
+
+    def patch(call):
+        bump(session, row.id)
+        return FakeResponse(200, {"id": 7001})
+    http.routes[("patch", "/api/v2/highlights/7001/")] = patch
+    push_dirty(session, user, http, book_info=lookup)
+    session.refresh(row)
+    assert row.readwise_dirty is True and row.readwise_id == "7001"
+
+
+def test_restore_during_delete_round_trip_stays_dirty_and_is_created_afresh(session, user, http):
+    mark_done(session)
+    row = add(session, "k1", "x")
+    row.readwise_id = "7001"
+    session.commit()
+    delete_from_side(session, USER, BOOK, "kobo", "k1", T0 + timedelta(hours=1))
+    session.commit()
+
+    def delete(call):
+        bump(session, row.id, deleted_at=None)  # restored on the device meanwhile
+        return FakeResponse(204)
+    http.routes[("delete", "/api/v2/highlights/7001/")] = delete
+    push_dirty(session, user, http, book_info=lookup)
+    # still dirty after the delete, so the same run created it afresh (a clear would have lost it)
+    assert [c["method"] for c in http.calls if c["method"] != "get"] == ["delete", "post"]
+    session.refresh(row)
+    assert row.readwise_id not in (None, "7001") and row.readwise_dirty is False
+
+
+def test_single_create_deduped_against_other_highlight_records_no_id(session, user, http, caplog):
+    """modified_highlights names a highlight Readwise already had (url differs): not ours."""
+    mark_done(session)
+    row = add(session, "k1", "Known passage")
+    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [3]}])
+    http.routes[("get", "/api/v2/export/")] = FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
+        {"user_book_id": 555, "highlights": [{"id": 3, "text": "Known passage", "url": "https://elsewhere/x"}]}]})
+    with caplog.at_level(logging.WARNING):
+        push_dirty(session, user, http, book_info=lookup)
+    session.refresh(row)
+    assert row.readwise_id is None and row.readwise_dirty is False
+    assert f"Highlight {row.id} was deduped against an existing Readwise highlight" in caplog.text
+    assert "Known passage" not in caplog.text
+
+    # never edited or deleted over there: an edit is a new create, a delete sends nothing
+    http.calls.clear()
+    delete_from_side(session, USER, BOOK, "kobo", "k1", T0 + timedelta(hours=1))
+    session.commit()
+    push_dirty(session, user, http, book_info=lookup)
+    assert http.calls == []
+
+
+def test_batch_dedupe_by_text_records_no_id_and_never_patches(session, user, http):
+    mark_done(session)
+    mine = add(session, "k1", "fresh one", xp0=xp(2, 1))
+    dup = add(session, "k2", "Known passage", xp0=xp(2, 2))
+    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(200, [{"id": 555, "modified_highlights": [4]}])
+    http.routes[("get", "/api/v2/export/")] = FakeResponse(200, {"count": 1, "nextPageCursor": None, "results": [
+        {"user_book_id": 555, "highlights": [
+            {"id": 4, "text": "fresh one", "url": f"cwa://{UUID}/highlight/{mine.id}"},
+            {"id": 3, "text": "known passage", "url": None}]}]})
+    push_dirty(session, user, http, book_info=lookup)
+    session.refresh(mine)
+    session.refresh(dup)
+    assert mine.readwise_id == "4" and dup.readwise_id is None
+    assert not mine.readwise_dirty and not dup.readwise_dirty
+    http.calls.clear()
+    delete_from_side(session, USER, BOOK, "kobo", "k2", T0 + timedelta(hours=1))
+    session.commit()
+    push_dirty(session, user, http, book_info=lookup)
+    assert not http.of("patch") and not http.of("delete")
+
+
+def test_one_bad_item_does_not_poison_the_batch(session, user, http, caplog):
+    mark_done(session)
+    rows = [add(session, f"k{n}", f"text {n}", xp0=xp(2, n)) for n in range(3)]
+    bad = rows[1]
+    default_post = http.default("post", "/api/v2/highlights/", None)
+
+    def post(call):
+        if any(h["text"] == "text 1" for h in call["json"]["highlights"]):
+            return FakeResponse(400, {"highlights": ["bad"]})
+        return default_post(call)
+    http.routes[("post", "/api/v2/highlights/")] = post
+    with caplog.at_level(logging.DEBUG):
+        result = push_dirty(session, user, http, book_info=lookup)
+    assert (result.created, result.quarantined) == (2, 1)
+    assert [len(c["json"]["highlights"]) for c in http.of("post")] == [3, 1, 1, 1]
+    for row in rows:
+        session.refresh(row)
+    assert [r.readwise_id is not None for r in rows] == [True, False, True]
+    assert bad.readwise_dirty is False and bad.readwise_error == "http 400"
+    assert f"highlight {bad.id} with 400" in caplog.text and "text 1" not in caplog.text
+
+    # left out of later runs...
+    http.calls.clear()
+    push_dirty(session, user, http, book_info=lookup)
+    assert http.calls == []
+    # ...until it changes, which clears the error and sends it again
+    upsert_from_side(session, USER, BOOK, "kobo", "k1", {"text": "text 1 fixed", "updated_at": T0 + timedelta(hours=1)},
+                     T0 + timedelta(hours=1))
+    session.commit()
+    session.refresh(bad)
+    assert bad.readwise_error is None and bad.readwise_dirty is True
+    http.routes[("post", "/api/v2/highlights/")] = default_post
+    push_dirty(session, user, http, book_info=lookup)
+    session.refresh(bad)
+    assert bad.readwise_id is not None and bad.readwise_dirty is False
+
+
+def test_lone_item_refused_is_quarantined_without_a_second_request(session, user, http):
+    mark_done(session)
+    row = add(session, "k1", "x")
+    http.routes[("post", "/api/v2/highlights/")] = FakeResponse(422, None)
+    result = push_dirty(session, user, http, book_info=lookup)
+    assert len(http.of("post")) == 1 and result.quarantined == 1
+    session.refresh(row)
+    assert row.readwise_error == "http 422" and row.readwise_dirty is False
+
+
+def test_patch_4xx_is_quarantined(session, user, http):
+    mark_done(session)
+    row = add(session, "k1", "x")
+    row.readwise_id = "7001"
+    session.commit()
+    http.routes[("patch", "/api/v2/highlights/7001/")] = FakeResponse(400, None)
+    result = push_dirty(session, user, http, book_info=lookup)
+    assert result.quarantined == 1 and len(http.of("patch")) == 1
+    session.refresh(row)
+    assert row.readwise_error == "http 400" and row.readwise_dirty is False and row.readwise_id == "7001"
+    http.calls.clear()
+    push_dirty(session, user, http, book_info=lookup)
+    assert http.calls == []
+
+
+def _task_env(monkeypatch, session_factory_calls, users, push):
+    """Run TaskReadwiseHighlights against an in-memory app db."""
     from cps import db
     from cps.progress_syncing import settings
     from cps.tasks import readwise_highlights
 
-    pushed = []
+    engine = create_engine("sqlite://")
+    ub.Base.metadata.create_all(engine)
+    from sqlalchemy.orm import scoped_session
+    scoped = scoped_session(sessionmaker(bind=engine))
+    for uid in users:
+        scoped.add(ub.User(id=uid, name=f"u{uid}", email=f"u{uid}@example.test", readwise_token="t"))
+    scoped.commit()
 
     class FakeCalibre:
         def __init__(self, *args, **kwargs):
             self.session = type("S", (), {"close": lambda self: None})()
 
-    class FakeSession:
-        def query(self, *a):
-            return self
+    def factory():
+        session_factory_calls.append(1)
+        return scoped
 
-        def filter(self, *a):
-            return self
-
-        def all(self):
-            return [type("U", (), {"id": 1, "readwise_token": "t"})()]
-
-        def rollback(self):
-            pass
-
-        def remove(self):
-            pass
-
-    monkeypatch.setattr(ub, "get_new_session_instance", lambda: FakeSession())
+    monkeypatch.setattr(readwise_highlights, "_app_db_session", None)
+    monkeypatch.setattr(ub, "get_new_session_instance", factory)
     monkeypatch.setattr(db, "CalibreDB", FakeCalibre)
-    monkeypatch.setattr(readwise, "push_dirty",
-                        lambda session, user, http=None, book_info=None: pushed.append((user.id, callable(book_info))))
-
-    monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: False)
-    task = readwise_highlights.TaskReadwiseHighlights()
-    task.run(None)
-    assert pushed == []
-
+    monkeypatch.setattr(readwise, "push_dirty", push)
     monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: True)
-    task = readwise_highlights.TaskReadwiseHighlights()
-    task.run(None)
-    assert pushed == [(1, True)]
-    assert task.error is None or task.error == ""
+    return readwise_highlights
+
+
+def test_task_reuses_one_engine_across_runs(monkeypatch):
+    calls = []
+    pushed = []
+    module = _task_env(monkeypatch, calls, [1],
+                       lambda session, user, http=None, book_info=None: pushed.append(user.id))
+    for _ in range(3):
+        task = module.TaskReadwiseHighlights()
+        task.run(None)
+        assert not task.error
+    assert len(calls) == 1 and pushed == [1, 1, 1]
+
+
+def test_one_users_failure_does_not_stop_the_others(monkeypatch, caplog):
+    pushed = []
+
+    def push(session, user, http=None, book_info=None):
+        if user.id == 1:
+            raise RuntimeError(f"boom with secret text and Token {TOKEN}")
+        pushed.append(user.id)
+
+    module = _task_env(monkeypatch, [], [1, 2, 5], push)
+    task = module.TaskReadwiseHighlights()
+    with caplog.at_level(logging.DEBUG):
+        task.run(None)
+    assert pushed == [2, 5]
+    assert "user 1" in caplog.text and "RuntimeError" in caplog.text
+    assert TOKEN not in caplog.text and "secret text" not in caplog.text
+    assert task.error  # reported, after everyone was tried
+
+
+def test_task_respects_the_setting(monkeypatch):
+    from cps.progress_syncing import settings
+    pushed = []
+    module = _task_env(monkeypatch, [], [1], lambda session, user, http=None, book_info=None: pushed.append(1))
+    monkeypatch.setattr(settings, "is_highlight_sync_enabled", lambda: False)
+    module.TaskReadwiseHighlights().run(None)
+    assert pushed == []

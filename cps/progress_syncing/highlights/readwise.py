@@ -74,6 +74,7 @@ class PushResult:
     updated: int = 0
     deleted: int = 0
     backfill_skipped: int = 0
+    quarantined: int = 0
     failed: int = 0
     rate_limited: bool = False
 
@@ -242,7 +243,8 @@ def _export_highlights(http, token, book_ids):
         if not cursor:
             return found
         params["pageCursor"] = cursor
-    return found
+    log.warning("Readwise export has more pages than the outbox reads; treating it as unknown")
+    return None
 
 
 def _readwise_books(http, token):
@@ -350,68 +352,129 @@ def backfill_skip_existing(session, user, http=requests, book_info=None) -> int:
 
 
 # --- push ---------------------------------------------------------------------
+#
+# Every request is followed by a write that depends on the highlight not having changed
+# meanwhile: a Kobo or Readest change made during the round trip bumps `version` and sets
+# `readwise_dirty`, and that must survive. So `readwise_dirty` is only ever cleared by an
+# UPDATE ... WHERE version = <version seen when the request was built>. The Readwise id
+# of a create is recorded regardless (the highlight exists in Readwise either way).
+
+def _settle(session, row_id, seen_version, **values) -> bool:
+    """Apply `values` to the row only if it is still at `seen_version`. Returns whether it was."""
+    changed = session.query(Highlight).filter(
+        Highlight.id == row_id, Highlight.version == seen_version).update(values, synchronize_session=False)
+    return bool(changed)
+
+
+def _record_id(session, row_id, readwise_id):
+    session.query(Highlight).filter(Highlight.id == row_id).update(
+        {"readwise_id": readwise_id}, synchronize_session=False)
+
+
+def _is_client_error(response) -> bool:
+    """A 4xx that says this request itself is refused (not auth, timeout or rate limit)."""
+    return 400 <= response.status_code < 500 and response.status_code not in (401, 403, 408, 429)
+
+
+def _quarantine(session, result, row_id, seen_version, response):
+    """Readwise refuses this version of the highlight: stop re-sending it until it changes."""
+    log.warning(f"Readwise refused highlight {row_id} with {response.status_code}; "
+                f"not retried until it changes")
+    _settle(session, row_id, seen_version, readwise_dirty=False, readwise_error=f"http {response.status_code}")
+    session.commit()
+    result.quarantined += 1
+
 
 def _push_deletes(session, user, http, result):
     for row in _dirty(session, user.id).filter(Highlight.deleted_at.isnot(None)).all():
-        if row.readwise_id is None:
-            row.readwise_dirty = False  # never sent: nothing to delete
+        row_id, seen, readwise_id = row.id, row.version, row.readwise_id
+        if readwise_id is None:
+            _settle(session, row_id, seen, readwise_dirty=False)  # never sent: nothing to delete
             session.commit()
             continue
         response = _request(http, user.readwise_token, "delete",
-                            f"{_api_base()}/api/v2/highlights/{row.readwise_id}/")
+                            f"{_api_base()}/api/v2/highlights/{readwise_id}/")
         if response.status_code in (200, 202, 204, 404):  # 404: already gone
-            row.readwise_id = None  # a restored highlight is created afresh
-            row.readwise_dirty = False
-            result.deleted += 1
+            # The Readwise copy is gone whatever happened locally meanwhile; a restored
+            # highlight is created afresh.
+            _record_id(session, row_id, None)
+            _settle(session, row_id, seen, readwise_dirty=False)
             session.commit()
+            result.deleted += 1
         else:
-            _failed(result, response, row.id)
+            _failed(result, response, row_id)
 
 
 def _push_edits(session, user, http, result):
     for row in _dirty(session, user.id).filter(
             Highlight.deleted_at.is_(None), Highlight.readwise_id.isnot(None)).all():
+        row_id, seen, readwise_id = row.id, row.version, row.readwise_id
+        payload = _patch_payload(row)
         response = _request(http, user.readwise_token, "patch",
-                            f"{_api_base()}/api/v2/highlights/{row.readwise_id}/",
-                            json=_patch_payload(row))
+                            f"{_api_base()}/api/v2/highlights/{readwise_id}/", json=payload)
         if response.status_code == 200:
-            row.readwise_dirty = False
-            result.updated += 1
+            _settle(session, row_id, seen, readwise_dirty=False)
             session.commit()
+            result.updated += 1
         elif response.status_code == 404:
             # Deleted in Readwise: it stays deleted there rather than being brought back.
-            log.warning(f"Readwise no longer has the copy of highlight {row.id}; not re-sent")
-            row.readwise_dirty = False
+            log.warning(f"Readwise no longer has the copy of highlight {row_id}; not re-sent")
+            _settle(session, row_id, seen, readwise_dirty=False)
             session.commit()
+        elif _is_client_error(response):
+            _quarantine(session, result, row_id, seen, response)
         else:
-            _failed(result, response, row.id)
+            _failed(result, response, row_id)
 
 
-def _created_ids(http, token, posted, response_books, rows_by_url):
-    """Map each posted highlight to the id Readwise gave it (None when unknown)."""
-    modified = [i for book in response_books or [] for i in (book.get("modified_highlights") or [])]
-    if len(posted) == 1 and len(modified) == 1:
-        return {posted[0].id: (str(modified[0]), True)}
+def _created_ids(http, token, response_books, rows_by_url):
+    """
+    Which of the posted highlights Readwise now holds as CWA's own copies: {row id: readwise id}.
+    Ownership is verified in the book's export: only an item whose `url` is exactly our
+    `highlight_url` counts, so a highlight Readwise deduped against an existing one (same
+    text, another url) is never recorded and so never edited or deleted. Returns None when
+    the export could not be read (nothing is known; the rows stay dirty).
+    """
     book_ids = [book.get("id") for book in response_books or [] if book.get("id") is not None]
     if not book_ids:
-        return {}
+        return None
     items = _export_highlights(http, token, book_ids)
     if items is None:
-        return {}
-    mapping = {}
-    by_text = {}
-    for item in items:
-        url = item.get("url")
-        if url in rows_by_url:
-            mapping[rows_by_url[url].id] = (str(item["id"]), True)
+        return None
+    return {rows_by_url[item["url"]]: str(item["id"]) for item in items
+            if item.get("url") in rows_by_url and item.get("id") is not None}
+
+
+def _post_creates(session, user, http, result, info, rows, locations, seen):
+    """
+    POST `rows` (one book) and record the outcome. Returns None when Readwise accepted the
+    request, else the refusing response.
+    """
+    payloads = [_create_payload(info, row, locations.get(row.id, 0)) for row in rows]
+    rows_by_url = {p["highlight_url"]: row.id for p, row in zip(payloads, rows)}
+    row_ids = [row.id for row in rows]
+    response = _request(http, user.readwise_token, "post",
+                        f"{_api_base()}/api/v2/highlights/", json={"highlights": payloads})
+    if response.status_code not in (200, 201):
+        return response
+    body = _json(response)
+    ids = _created_ids(http, user.readwise_token, body if isinstance(body, list) else [], rows_by_url)
+    if ids is None:
+        log.warning(f"Readwise ids not found for highlights {row_ids}; left for the next run")
+        result.failed += len(row_ids)
+        return None
+    for row_id in row_ids:
+        if row_id in ids:
+            _record_id(session, row_id, ids[row_id])
+            _settle(session, row_id, seen[row_id], readwise_dirty=False)
+            result.created += 1
         else:
-            by_text.setdefault(_normalize(item.get("text")), item)
-    for row in posted:
-        if row.id not in mapping and _normalize(row.text) in by_text:
-            # Readwise held this passage already (the POST was deduped against it): it
-            # is not ours, so keep no id.
-            mapping[row.id] = (None, False)
-    return mapping
+            log.warning(f"Highlight {row_id} was deduped against an existing Readwise highlight; "
+                        f"CWA keeps no copy there")
+            _settle(session, row_id, seen[row_id], readwise_dirty=False)
+            result.backfill_skipped += 1
+    session.commit()
+    return None
 
 
 def _push_creates(session, user, http, result, lookup):
@@ -432,37 +495,36 @@ def _push_creates(session, user, http, result, lookup):
             if (row.text or "").strip():
                 sendable.append(row)
             else:
-                row.readwise_dirty = False  # Readwise requires text
+                _settle(session, row.id, row.version, readwise_dirty=False)  # Readwise requires text
         session.commit()
         locations = _locations(session, user.id, book_id)
         for start in range(0, len(sendable), CREATE_CHUNK):
             chunk = sendable[start:start + CREATE_CHUNK]
-            payloads = [_create_payload(info, row, locations.get(row.id, 0)) for row in chunk]
-            response = _request(http, user.readwise_token, "post",
-                                f"{_api_base()}/api/v2/highlights/", json={"highlights": payloads})
-            if response.status_code not in (200, 201):
-                log.warning(f"Readwise answered {response.status_code} for highlights "
-                            f"{[row.id for row in chunk]}; left for the next run")
+            seen = {row.id: row.version for row in chunk}
+            refused = _post_creates(session, user, http, result, info, chunk, locations, seen)
+            if refused is None:
+                continue
+            if not _is_client_error(refused):
+                log.warning(f"Readwise answered {refused.status_code} for highlights "
+                            f"{list(seen)}; left for the next run")
                 result.failed += len(chunk)
-                if response.status_code in (401, 403) or response.status_code >= 500:
+                if refused.status_code in (401, 403) or refused.status_code >= 500:
                     raise _Stop()
                 continue
-            body = _json(response)
-            rows_by_url = {_highlight_url(info, row): row for row in chunk}
-            ids = _created_ids(http, user.readwise_token, chunk,
-                               body if isinstance(body, list) else [], rows_by_url)
+            # One bad item must not hold back the rest: try each on its own, once.
+            if len(chunk) == 1:
+                _quarantine(session, result, chunk[0].id, seen[chunk[0].id], refused)
+                continue
             for row in chunk:
-                if row.id in ids:
-                    readwise_id, ours = ids[row.id]
-                    row.readwise_id = readwise_id
-                    row.readwise_dirty = False
-                    result.created += 1 if ours else 0
-                    result.backfill_skipped += 0 if ours else 1
-            session.commit()
-            missing = [row.id for row in chunk if row.id not in ids]
-            if missing:
-                log.warning(f"Readwise ids not found for highlights {missing}; left for the next run")
-                result.failed += len(missing)
+                row_seen = {row.id: seen[row.id]}
+                row_id = row.id
+                refused = _post_creates(session, user, http, result, info, [row], locations, row_seen)
+                if refused is None:
+                    continue
+                if _is_client_error(refused):
+                    _quarantine(session, result, row_id, seen[row_id], refused)
+                else:
+                    _failed(result, refused, row_id)
 
 
 def push_dirty(session, user, http=requests, book_info=None) -> PushResult:
@@ -492,7 +554,8 @@ def push_dirty(session, user, http=requests, book_info=None) -> PushResult:
         result.rate_limited = True
     except _Stop:
         session.rollback()
-    if result.created or result.updated or result.deleted or result.failed:
+    if result.created or result.updated or result.deleted or result.failed or result.quarantined:
         log.info(f"Readwise push for user {user.id}: {result.created} created, {result.updated} "
-                 f"updated, {result.deleted} deleted, {result.failed} failed")
+                 f"updated, {result.deleted} deleted, {result.quarantined} quarantined, "
+                 f"{result.failed} failed")
     return result
