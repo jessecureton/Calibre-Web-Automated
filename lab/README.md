@@ -10,14 +10,15 @@
 
 ## Highlight sync roll back
 
-Once highlight sync has been on, the Kobo talks to CWA for highlights instead of Kobo's
-cloud, and Kobo's cloud holds nothing for CWA books. Before returning to any image
-without highlight sync:
-1. Turn the setting off and let the Kobo sync once. "Off after on" is a safe mode: CWA
-   names no books and serves the stored set.
-2. Then switch images.
+Once highlight sync has been on, roll forward, or roll back only to another
+highlight-sync image (`v4.0.8-highlight-sync.N`) with the setting off. "Off after on"
+is a safe mode: the Kobo keeps talking to CWA for highlights, CWA names no books and
+serves the stored set, and a PATCH is still recorded.
 
-A Kobo pointed back at Kobo's cloud may lose highlights in CWA books on the next refresh.
+Never return to a stock image, or to a position-bridge image without highlight sync.
+It points the Kobo back at Kobo's cloud, which holds nothing for CWA books, so the Kobo
+can lose its highlights in CWA books on its next refresh.
+
 The stored highlights stay in `app.db` (`highlight`, `kobo_opaque_annotation`).
 
 ## Deploy and roll back
