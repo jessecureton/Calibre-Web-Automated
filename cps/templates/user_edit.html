@@ -341,6 +341,49 @@
     </div>
     {% endif %}
     
+    {% if (profile and highlight_sync_visible) or highlight_admin %}
+    <!-- Highlight Sync Card -->
+    <div class="settings-container" style="max-width: none; margin-inline: 0rem;">
+      <h4 class="settings-section-header">{{_('Highlight Sync')}}</h4>
+
+      {% if profile %}
+      <div class="form-group">
+        <label for="readwise_token">{{_('Readwise access token')}}</label>
+        <input type="password" class="form-control" name="readwise_token" id="readwise_token" autocomplete="new-password" placeholder="{% if content.readwise_token %}&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;{% else %}{{_('Paste your Readwise access token')}}{% endif %}">
+        <p class="cwa-settings-tip" id="readwise_token_status">{% if content.readwise_token %}{{_('Readwise token is set.')}}{% else %}{{_('Readwise token is not set.')}}{% endif %} {{_('Leave the field blank to keep it. Highlights are copied to Readwise as an archive.')}}</p>
+        {% if content.readwise_token %}
+        <div class="checkbox">
+          <label for="remove_readwise_token"><input type="checkbox" name="remove_readwise_token" id="remove_readwise_token"> {{_('Remove Readwise token')}}</label>
+        </div>
+        {% endif %}
+      </div>
+
+      <div class="form-group">
+        <label>{{_('Readest password')}}</label>
+        <div>
+          <button type="submit" class="btn btn-default" id="generate_highlight_sync_password" formaction="{{ url_for('web.highlight_sync_password') }}" formmethod="post" formnovalidate>{{_('Generate highlight-sync password for Readest')}}</button>
+        </div>
+        <p class="cwa-settings-tip">{{_('Readest signs in with a password made just for highlight sync, so your CWA password stays private. Generating a new one replaces the old one, and it is shown only once. Enter it in Readest under Settings, Integrations, BookOrbit.')}}</p>
+      </div>
+      {% endif %}
+
+      {% if highlight_admin %}
+      <div class="form-group">
+        <p><strong>{{_('Readest device')}}:</strong> <span id="highlight-readest-device">{{ highlight_admin.readest_device_id or _('none') }}</span></p>
+        <p><strong>{{_('Kobo firmware last seen')}}:</strong> <span id="highlight-kobo-firmware">{{ highlight_admin.kobo_firmware or _('none') }}</span></p>
+        <p><strong>{{_('Held deletions')}}:</strong> <span id="highlight-held-count">{{ highlight_admin.held_count }}</span></p>
+        {% if highlight_admin.readest_device_id %}
+        <button type="submit" class="btn btn-default" id="highlight_reset_device" formaction="{{ url_for('admin.highlight_reset_readest_device', user_id=content.id) }}" formmethod="post" formnovalidate>{{_('Reset Readest device')}}</button>
+        {% endif %}
+        {% if highlight_admin.held_count %}
+        <button type="submit" class="btn btn-danger" id="highlight_apply_held" formaction="{{ url_for('admin.highlight_apply_held_deletions', user_id=content.id) }}" formmethod="post" formnovalidate onclick="return confirm('{{_('Delete the highlights Readest asked to delete?')}}');">{{_('Apply held deletions')}}</button>
+        {% endif %}
+        <p class="cwa-settings-tip">{{_('Reset the device when the user moves to a new phone or reinstalls Readest. Held deletions are Readest deletions paused because they looked like a mass deletion.')}}</p>
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+
     <!-- Sidebar Display Settings Card -->
     <div class="settings-container" style="max-width: none; margin-inline: 0rem;">
       <h4 class="settings-section-header">{{_('Sidebar Display Settings')}}</h4>

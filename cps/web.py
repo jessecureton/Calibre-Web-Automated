@@ -42,6 +42,7 @@ from .pagination import Pagination
 from .redirect import get_redirect_location
 from .cw_babel import get_available_locale
 from .usermanagement import login_required_if_no_ano
+from .progress_syncing.highlights import profile as highlight_profile
 from .kobo_sync_status import remove_synced_book
 from . import magic_shelf
 from .render_template import render_title_template
@@ -2428,6 +2429,7 @@ def change_profile(kobo_support, hardcover_support, local_oauth_check, oauth_sta
         if old_state == 0 and current_user.kobo_only_shelves_sync == 1:
             kobo_sync_status.update_on_sync_shelfs(current_user.id)
         current_user.hardcover_token = to_save.get("hardcover_token","" ).replace("Bearer ","" ) or None
+        highlight_profile.apply_readwise_form(current_user, to_save)
         # Auto-send and metadata fetch settings
         current_user.auto_send_enabled = to_save.get("auto_send_enabled") == "on"
         current_user.auto_metadata_fetch = to_save.get("auto_metadata_fetch") == "on"
@@ -2647,6 +2649,7 @@ def change_profile(kobo_support, hardcover_support, local_oauth_check, oauth_sta
                                      page="me",
                                      kobo_support=kobo_support,
                                      hardcover_support=hardcover_support,
+                                     highlight_sync_visible=highlight_profile.section_visible(),
                                      registered_oauth=local_oauth_check,
                                      oauth_status=oauth_status)
 
@@ -2676,6 +2679,31 @@ def change_profile(kobo_support, hardcover_support, local_oauth_check, oauth_sta
         ub.session.rollback()
         log.error("Database error: %s", e)
         flash(_("Oops! Database Error: %(error)s.", error=e), category="error")
+
+
+@web.route("/me/highlight-sync-password", methods=["POST"])
+@user_login_required
+def highlight_sync_password():
+    """Give the user a new Readest password and show it, this once, in the response."""
+    if not highlight_profile.section_visible():
+        abort(404)
+    password = highlight_profile.new_sync_password(current_user)
+    try:
+        ub.session.commit()
+    except (IntegrityError, OperationalError) as e:
+        ub.session.rollback()
+        log.error("Database error: %s", e)
+        flash(_("Oops! Database Error: %(error)s.", error=e), category="error")
+        return redirect(url_for('web.profile'))
+    log.info("User %s generated a new highlight-sync password", current_user.id)
+    resp = make_response(render_title_template("highlight_sync_password.html",
+                                               password=password,
+                                               username=current_user.name,
+                                               server_url=url_for('web.index', _external=True).rstrip("/"),
+                                               title=_("Highlight-sync password"),
+                                               page="me"))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @web.route("/me", methods=["GET", "POST"])
@@ -2760,6 +2788,7 @@ def profile():
                                  config=config,
                                  kobo_support=kobo_support,
                                  hardcover_support=hardcover_support,
+                                 highlight_sync_visible=highlight_profile.section_visible(),
                                  system_shelf_templates=system_shelf_templates,
                                  hidden_shelf_templates=hidden_shelf_templates,
                                  hidden_custom_shelf_ids=hidden_custom_shelf_ids,

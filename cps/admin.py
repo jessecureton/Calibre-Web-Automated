@@ -46,6 +46,7 @@ from .usermanagement import user_login_required
 from .cw_babel import get_available_translations, get_available_locale, get_user_locale_language
 from . import debug_info
 from .progress_syncing.highlights import kobo_import
+from .progress_syncing.highlights import profile as highlight_profile
 from .string_helper import strip_whitespaces
 
 log = logger.create()
@@ -1930,11 +1931,14 @@ def edit_user(user_id):
             return resp
     opds_context = _build_opds_context(content)
     magic_shelf_context = _build_magic_shelf_order_context(content)
+    highlight_admin = highlight_profile.admin_summary(ub.session, content.id) \
+        if highlight_profile.section_visible() else None
     return render_title_template("user_edit.html",
                                  translations=translations,
                                  languages=languages,
                                  new_user=0,
                                  content=content,
+                                 highlight_admin=highlight_admin,
                                  config=config,
                                  registered_oauth=oauth_bb.oauth_check,
                                  mail_configured=config.get_mail_server_configured(),
@@ -1952,6 +1956,55 @@ def edit_user(user_id):
                                  magic_shelf_order_mode=magic_shelf_context["magic_shelf_order_mode"],
                                  title=_("Edit User %(nick)s", nick=content.name),
                                  page="edituser")
+
+
+def _highlight_user_or_404(user_id):
+    user = ub.session.query(ub.User).filter(ub.User.id == user_id).first()
+    if user is None:
+        abort(404)
+    return user
+
+
+@admi.route("/admin/user/<int:user_id>/highlight-sync/reset-device", methods=["POST"])
+@user_login_required
+@admin_required
+def highlight_reset_readest_device(user_id):
+    """Forget the user's recorded Readest device, so a new Readest can take its place."""
+    user = _highlight_user_or_404(user_id)
+    try:
+        reset = highlight_profile.reset_readest_device(ub.session, user.id)
+        ub.session.commit()
+    except Exception:
+        ub.session.rollback()
+        log.exception("[highlight-sync] resetting the Readest device failed")
+        flash(_("Could not reset the Readest device. See the log for details."), category="error")
+        return redirect(url_for("admin.edit_user", user_id=user.id))
+    if reset:
+        log.info("[highlight-sync] user=%s: Readest device reset by admin %s", user.id, current_user.id)
+        flash(_("The Readest device for %(name)s was reset. The next Readest to sync becomes the device.",
+                name=user.name), category="success")
+    else:
+        flash(_("No Readest device is recorded for %(name)s.", name=user.name), category="info")
+    return redirect(url_for("admin.edit_user", user_id=user.id))
+
+
+@admi.route("/admin/user/<int:user_id>/highlight-sync/apply-held", methods=["POST"])
+@user_login_required
+@admin_required
+def highlight_apply_held_deletions(user_id):
+    """Apply the Readest deletions held back for the user (a mass deletion Readest asked for)."""
+    user = _highlight_user_or_404(user_id)
+    try:
+        deleted = highlight_profile.apply_held_deletions(ub.session, user.id)
+        ub.session.commit()
+    except Exception:
+        ub.session.rollback()
+        log.exception("[highlight-sync] applying held deletions failed")
+        flash(_("Could not apply the held deletions. See the log for details."), category="error")
+        return redirect(url_for("admin.edit_user", user_id=user.id))
+    flash(_("Applied the held deletions for %(name)s: %(count)s highlights deleted.",
+            name=user.name, count=deleted), category="success")
+    return redirect(url_for("admin.edit_user", user_id=user.id))
 
 
 @admi.route("/admin/resetpassword/<int:user_id>", methods=["POST"])
