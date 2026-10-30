@@ -13,7 +13,7 @@ import time
 import sys
 import string
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from datetime import time as datetime_time
 from functools import wraps
 from urllib.parse import urlparse
@@ -23,6 +23,7 @@ import tempfile
 import fcntl
 
 from flask import Blueprint, current_app, flash, redirect, url_for, abort, request, make_response, send_from_directory, g, Response, jsonify
+from flask import session as flask_session
 from markupsafe import Markup
 from .cw_login import current_user
 from flask_babel import gettext as _
@@ -44,6 +45,7 @@ from .services.worker import WorkerThread
 from .usermanagement import user_login_required
 from .cw_babel import get_available_translations, get_available_locale, get_user_locale_language
 from . import debug_info
+from .progress_syncing.highlights import kobo_import
 from .string_helper import strip_whitespaces
 
 log = logger.create()
@@ -3119,3 +3121,88 @@ def restore_calibre_db():
                     pass
         except Exception:
             pass
+
+
+# --- Import highlights from a Kobo database ---
+HIGHLIGHT_IMPORT_SESSION_KEY = "highlight_import_token"
+
+
+def _highlight_import_page(**context):
+    users = ub.session.query(ub.User).order_by(ub.User.name).all()
+    context.setdefault("selected_user", current_user.id)
+    return render_title_template("highlights_import.html", title=_("Import Kobo highlights"),
+                                 page="highlights_import", users=users, **context)
+
+
+def _forget_highlight_import():
+    kobo_import.discard_stash(flask_session.pop(HIGHLIGHT_IMPORT_SESSION_KEY, None))
+
+
+@admi.route("/admin/highlights/import", methods=["GET", "POST"])
+@user_login_required
+@admin_required
+def highlights_import():
+    """Dry-run an import of highlights from KoboReader.sqlite (and an optional older copy)."""
+    kobo_import.purge_expired()
+    if request.method == "GET":
+        return _highlight_import_page()
+
+    upload = request.files.get("kobo_db")
+    older = request.files.get("older_db")
+    user_id = request.form.get("user_id", type=int)
+    target = ub.session.query(ub.User).filter(ub.User.id == user_id).first() if user_id is not None else None
+    if not upload or not upload.filename:
+        flash(_("Choose the KoboReader.sqlite file to import."), category="error")
+        return _highlight_import_page()
+    if target is None:
+        flash(_("Choose the user to import the highlights for."), category="error")
+        return _highlight_import_page()
+
+    _forget_highlight_import()
+    token = kobo_import.save_stash(upload, older if older and older.filename else None, target.id)
+    try:
+        stash = kobo_import.load_stash(token)
+        rows = kobo_import.read_kobo_highlights(stash.main_path)
+        older_rows = kobo_import.read_kobo_highlights(stash.older_path) if stash.older_path else []
+        plan = kobo_import.plan_import(ub.session, target.id, rows, older_rows)
+    except kobo_import.KoboDatabaseError as e:
+        kobo_import.discard_stash(token)
+        log.warning("[highlight-sync] import upload refused: %s", e)
+        flash(_("That is not a Kobo database with highlights in it (KoboReader.sqlite)."), category="error")
+        return _highlight_import_page()
+    except Exception:
+        kobo_import.discard_stash(token)
+        log.exception("[highlight-sync] could not plan the import")
+        flash(_("The import could not be planned. See the log for details."), category="error")
+        return _highlight_import_page()
+    flask_session[HIGHLIGHT_IMPORT_SESSION_KEY] = token
+    return _highlight_import_page(plan=plan, counts=plan.counts(), summary=plan.summary(), token=token,
+                                  selected_user=target.id, target_name=target.name,
+                                  has_older=bool(stash.older_path))
+
+
+@admi.route("/admin/highlights/import/apply", methods=["POST"])
+@user_login_required
+@admin_required
+def highlights_import_apply():
+    """Apply the import planned by the last upload: only the files kept for this session's token."""
+    token = request.form.get("token")
+    stash = kobo_import.load_stash(token) if token and token == flask_session.get(HIGHLIGHT_IMPORT_SESSION_KEY) \
+        else None
+    if stash is None:
+        flash(_("That import has expired. Upload the database again."), category="error")
+        return redirect(url_for("admin.highlights_import"))
+    try:
+        rows = kobo_import.read_kobo_highlights(stash.main_path)
+        older_rows = kobo_import.read_kobo_highlights(stash.older_path) if stash.older_path else []
+        plan = kobo_import.plan_import(ub.session, stash.user_id, rows, older_rows)
+        stored = kobo_import.apply_import(ub.session, stash.user_id, plan, datetime.now(timezone.utc))
+        ub.session.commit()
+    except Exception:
+        ub.session.rollback()
+        log.exception("[highlight-sync] import failed")
+        flash(_("The import failed and nothing was imported. See the log for details."), category="error")
+        return redirect(url_for("admin.highlights_import"))
+    _forget_highlight_import()
+    flash(_("Imported %(count)s highlights.", count=stored), category="info")
+    return redirect(url_for("admin.highlights_import"))

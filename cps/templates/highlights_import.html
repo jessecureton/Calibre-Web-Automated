@@ -1,0 +1,77 @@
+{% extends "layout.html" %}
+
+{% block body %}
+<div class="discover">
+  <h2 style="color: white !important;">{{ title }}</h2>
+  <p style="font-size: 12px; max-width: 700px;">
+    {{ _('Add the highlights stored on a Kobo to a CWA user. Upload the KoboReader.sqlite copied from the device (.kobo/KoboReader.sqlite). You see a summary first and nothing is written until you press Import. An import never deletes or changes a highlight CWA already has, and running it again adds nothing new.') }}
+  </p>
+
+  <form method="POST" action="{{ url_for('admin.highlights_import') }}" enctype="multipart/form-data" style="max-width: 700px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="form-group">
+      <label for="kobo_db">{{ _('KoboReader.sqlite') }}</label>
+      <input type="file" class="form-control" id="kobo_db" name="kobo_db" accept=".sqlite,.db" required>
+    </div>
+    <div class="form-group">
+      <label for="older_db">{{ _('Older copy (optional)') }}</label>
+      <input type="file" class="form-control" id="older_db" name="older_db" accept=".sqlite,.db">
+      <p class="help-block" style="font-size: 11px;">{{ _('A copy from before the books moved to CWA. Its highlights are matched to library books by title and author, and added only if their text is not already among the book\'s highlights.') }}</p>
+    </div>
+    <div class="form-group">
+      <label for="user_id">{{ _('Import for user') }}</label>
+      <select class="form-control" id="user_id" name="user_id">
+        {% for user in users %}
+        <option value="{{ user.id }}"{% if user.id == selected_user %} selected{% endif %}>{{ user.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="btn btn-default">{{ _('Check') }}</button>
+  </form>
+
+  {% if plan is defined %}
+  <h3 style="margin-top: 30px;">{{ _('Summary for %(user)s', user=target_name) }}</h3>
+  <table class="table table-condensed" id="highlights_import_counts" style="max-width: 700px;">
+    <tbody>
+      <tr><td>{{ _('New highlights to import') }}</td><td>{{ counts.new }}</td></tr>
+      <tr><td>{{ _('Already in CWA') }}</td><td>{{ counts.already_present }}</td></tr>
+      {% if has_older %}
+      <tr><td>{{ _('Recovered from the older copy') }}</td><td>{{ counts.recovered }}</td></tr>
+      {% endif %}
+      <tr><td>{{ _('Could not be matched') }}</td><td>{{ counts.unmatched }}</td></tr>
+    </tbody>
+  </table>
+
+  {% if summary %}
+  <table class="table table-striped table-condensed" id="highlights_import_books" style="max-width: 900px;">
+    <thead>
+      <tr>
+        <th>{{ _('Book') }}</th><th>{{ _('New') }}</th><th>{{ _('Already in CWA') }}</th>
+        {% if has_older %}<th>{{ _('Recovered') }}</th>{% endif %}
+        <th>{{ _('Not matched') }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for book in summary %}
+      <tr>
+        <td>{{ book.title }}</td><td>{{ book.new }}</td><td>{{ book.already_present }}</td>
+        {% if has_older %}<td>{{ book.recovered }}</td>{% endif %}
+        <td>{{ book.unmatched }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if counts.new or counts.recovered %}
+  <form method="POST" action="{{ url_for('admin.highlights_import_apply') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button type="submit" class="btn btn-default">{{ _('Import') }}</button>
+  </form>
+  {% else %}
+  <p>{{ _('There is nothing to import.') }}</p>
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

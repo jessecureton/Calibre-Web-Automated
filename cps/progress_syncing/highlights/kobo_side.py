@@ -214,6 +214,33 @@ def _kobo_xpointers(books: _Books, location: dict, kobo_id: str):
     return xps or (None, None)
 
 
+def _content_fields(entry: dict, location: dict, keep_location: bool) -> dict:
+    """The store fields a Kobo annotation sets: text, note, colour, and its location unless kept."""
+    fields = {"text": entry.get("highlightedText"), "note": entry.get("noteText") or None}
+    if not keep_location:
+        fields.update(location)
+    if KOBO_SENDS_COLOR and isinstance(entry.get("highlightColor"), str):
+        color = KOBO_TO_READEST_COLOR.get(entry["highlightColor"].upper())
+        if color:
+            fields["color"] = color
+    return fields
+
+
+def fields_from_entry(books: _Books, entry: dict) -> dict:
+    """
+    The store fields of a Kobo annotation with a complete location, as a new row.
+
+    Exactly what `apply_kobo_patch` stores for a create: the same text, note,
+    verbatim location and XPointers (None when untranslatable). Timestamps are
+    the caller's.
+    """
+    location = _location(entry)
+    fields = _content_fields(entry, location, False)
+    xps = _kobo_xpointers(books, location, entry["id"])
+    fields["xp0"], fields["xp1"] = xps if xps else (None, None)
+    return fields
+
+
 def kobo_patch_error(body) -> Optional[str]:
     """Why a PATCH body can't be stored whole, or None. Nothing in it may be acknowledged unstored."""
     if not isinstance(body, dict):
@@ -309,14 +336,7 @@ def apply_kobo_patch(session, user_id: int, book_id: int, body: dict, now: datet
         if books is None:
             epub_path, kepub_path = files(book_id)
             books = _Books(session, user_id, book_id, epub_path, kepub_path)
-        note = entry.get("noteText") or None
-        fields = {"text": entry.get("highlightedText"), "note": note}
-        if not keep_location:
-            fields.update(location)
-        if KOBO_SENDS_COLOR and isinstance(entry.get("highlightColor"), str):
-            color = KOBO_TO_READEST_COLOR.get(entry["highlightColor"].upper())
-            if color:
-                fields["color"] = color
+        fields = _content_fields(entry, location, keep_location)
 
         moved = not keep_location and (existing is None or existing.xp0 is None or
                                        any(getattr(existing, name) != location[name] for name in _KOBO_FIELDS))
