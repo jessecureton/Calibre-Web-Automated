@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint,
+    Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, UniqueConstraint, text,
 )
 
 from ... import logger
@@ -48,7 +48,12 @@ class Highlight(AppBase):
         kobo_id: the Kobo BookmarkID (a uuid string), unique per user; import rows carry it too
         kobo_*: location as Nickel sent it, paths stored verbatim
         xp0, xp1: start and end XPointers into the EPUB
-        readest_key, readest_datetime: Readest's identity for the highlight
+        readest_key, readest_datetime: Readest's identity for the highlight; the key is
+            unique per user
+        readest_version: the highest `version` Readest is known to hold (it sent it,
+            or acked it)
+        readest_failed_version: the `version` Readest last reported it could not apply;
+            not offered again until the version moves
         version: bumped on every applied change
         readwise_id, readwise_dirty: Readwise export bookkeeping
     """
@@ -56,6 +61,8 @@ class Highlight(AppBase):
     __table_args__ = (
         UniqueConstraint('user_id', 'kobo_id'),
         Index('ix_highlight_user_book', 'user_id', 'book_id'),
+        Index('ux_highlight_user_readest_key', 'user_id', 'readest_key', unique=True,
+              sqlite_where=text('readest_key IS NOT NULL')),
     )
 
     id = Column(Integer, primary_key=True)
@@ -79,6 +86,8 @@ class Highlight(AppBase):
     xp1 = Column(String)
     readest_key = Column(String)
     readest_datetime = Column(String)
+    readest_version = Column(Integer)
+    readest_failed_version = Column(Integer)
     version = Column(Integer, nullable=False, default=1, server_default='1')
     readwise_id = Column(String)
     readwise_dirty = Column(Boolean, nullable=False, default=False, server_default='0')
@@ -152,6 +161,7 @@ _HIGHLIGHT_COLUMNS = (
     "kobo_chapter TEXT", "kobo_start_path TEXT", "kobo_start_char INTEGER",
     "kobo_end_path TEXT", "kobo_end_char INTEGER", "kobo_chapter_progress REAL",
     "xp0 TEXT", "xp1 TEXT", "readest_key TEXT", "readest_datetime TEXT",
+    "readest_version INTEGER", "readest_failed_version INTEGER",
     "version INTEGER NOT NULL DEFAULT 1",
     "readwise_id TEXT", "readwise_dirty BOOLEAN NOT NULL DEFAULT 0",
 )
@@ -197,6 +207,17 @@ def ensure_highlight_tables(conn):
         conn.commit()
     except Exception as e:
         log.error(f"Could not create highlight tables: {e}")
+        return
+    try:
+        # Its own step, so a table that somehow holds a duplicate key can't stop the
+        # tables above from being made.
+        _execute_sql_with_retry(
+            conn, "CREATE UNIQUE INDEX IF NOT EXISTS ux_highlight_user_readest_key "
+                  "ON highlight (user_id, readest_key) WHERE readest_key IS NOT NULL",
+            hasattr(conn, 'execute') and hasattr(conn.execute.__self__, 'dialect'))
+        conn.commit()
+    except Exception as e:
+        log.error(f"Could not create the unique Readest key index: {e}")
 
 
 def _utc(value: datetime) -> datetime:

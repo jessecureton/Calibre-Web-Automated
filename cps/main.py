@@ -33,6 +33,7 @@ def main():
     from .error_handler import init_errorhandler
     from .remotelogin import remotelogin
     from .progress_syncing.protocols.kosync import kosync
+    from .progress_syncing.highlights.bookorbit import bookorbit
     from .duplicates import duplicates
     try:
         from .kobo import kobo, get_kobo_activated
@@ -82,6 +83,7 @@ def main():
     app.register_blueprint(gdrive)
     app.register_blueprint(editbook)
     app.register_blueprint(kosync)
+    app.register_blueprint(bookorbit)
     app.register_blueprint(duplicates)
     if kobo_available:
         app.register_blueprint(kobo)

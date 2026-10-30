@@ -43,7 +43,7 @@ from typing import Dict, Optional, Any, Tuple
 from ...services import SyncToken as SyncToken, hardcover
 from ...kobo import push_reading_state_to_hardcover
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, g, request, jsonify
 from flask_babel import gettext as _
 from werkzeug.security import check_password_hash
 from sqlalchemy import func, desc
@@ -149,9 +149,17 @@ def authenticate_user() -> Optional[ub.User]:
         - Case-insensitive username lookup for consistency with Calibre-Web
         - Validates credential format before database lookup
 
+    A route that has already authenticated the request another way (the BookOrbit
+    routes Readest syncs progress through, which use X-Auth-User/X-Auth-Key) sets
+    `g.sync_user` before delegating to these handlers; that user is used as is.
+
     Returns:
         User object if authentication succeeds, None otherwise
     """
+    preauthenticated = g.get("sync_user")
+    if preauthenticated is not None:
+        return preauthenticated
+
     if config.config_allow_reverse_proxy_header_login:
         if user := usermanagement.load_user_from_reverse_proxy_header(request):
             return user
