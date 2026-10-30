@@ -1132,6 +1132,21 @@ def migrate_shelf_table(engine, _session):
         _run_ddl_with_retry(engine, "ALTER TABLE shelf ADD column 'kobo_sync' Boolean DEFAULT 0")
 
 
+def _ensure_progress_sync_tables(engine, _session):
+    """Ensure the progress syncing tables in app.db (user-related tables).
+
+    "Highlight sync ever on" is read here whatever else is on, with retries, so the
+    process remembers it before the first Kobo request has to decide its routing.
+    """
+    from .progress_syncing import models, settings
+    ever = settings.warm_highlight_sync_ever(_session)
+    if settings.is_koreader_sync_enabled():
+        models.ensure_app_db_tables(engine.raw_connection())
+    elif ever:
+        from .progress_syncing.highlights.store import ensure_highlight_tables
+        ensure_highlight_tables(engine.raw_connection())
+
+
 # Migrate database to current version, has to be updated after every database change. Currently migration from
 # maybe 4/5 versions back to current should work.
 # Migration is done by checking if relevant columns are existing, and then adding rows with SQL commands
@@ -1146,14 +1161,7 @@ def migrate_Database(_session):
     migrate_config_table(engine, _session)
     migrate_magic_shelf_table(engine, _session)
 
-    # Ensure progress syncing tables in app.db (user-related tables)
-    from .progress_syncing.models import ensure_app_db_tables
-    from .progress_syncing.settings import is_koreader_sync_enabled, highlight_sync_ever_enabled
-    if is_koreader_sync_enabled():
-        ensure_app_db_tables(engine.raw_connection())
-    elif highlight_sync_ever_enabled():
-        from .progress_syncing.highlights.store import ensure_highlight_tables
-        ensure_highlight_tables(engine.raw_connection())
+    _ensure_progress_sync_tables(engine, _session)
     
     # Migrate system magic shelves for existing users
     try:

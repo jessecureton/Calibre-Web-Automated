@@ -468,11 +468,95 @@ class TestSettings:
                      kobo_readest_highlight_sync_ever=1, highlight_sync_kobo_firmware="")
         assert highlight_sync_ever_enabled() is True
 
-    def test_fails_closed(self, monkeypatch):
+    def test_fails_closed(self, monkeypatch, app_db):
         _fake_cwa_db(monkeypatch, error=RuntimeError("no db"))
         assert is_highlight_sync_enabled() is False
-        assert highlight_sync_ever_enabled() is False
+        assert highlight_sync_ever_enabled() is False  # unreadable, and app.db holds no highlight state
         assert tested_kobo_firmware() == set()
+
+    @pytest.fixture
+    def app_db(self, monkeypatch):
+        engine = create_engine("sqlite://")
+        ub.Base.metadata.create_all(engine)
+        s = sessionmaker(bind=engine)()
+        monkeypatch.setattr(ub, "session", s)
+        yield s
+        s.close()
+
+    def test_unreadable_ever_counts_as_on_when_app_db_has_highlight_state(self, tmp_path, monkeypatch, app_db):
+        app_db.add(HighlightBookState(user_id=USER, book_id=BOOK, kobo_etag_version=1))
+        app_db.commit()
+        _fake_cwa_db(monkeypatch, error=RuntimeError("no db"))  # and no cwa.db file
+        assert highlight_sync_ever_enabled() is True
+        app_db.query(HighlightBookState).delete()
+        app_db.commit()
+        assert highlight_sync_ever_enabled() is True  # remembered, like a read of 1
+
+    def test_a_clean_zero_is_not_overridden_by_app_db(self, tmp_path, monkeypatch, app_db):
+        app_db.add(HighlightBookState(user_id=USER, book_id=BOOK, kobo_etag_version=1))
+        app_db.commit()
+        _cwa_db_file(tmp_path, kobo_readest_highlight_sync=0,
+                     kobo_readest_highlight_sync_ever=0, highlight_sync_kobo_firmware="")
+        assert highlight_sync_ever_enabled() is False
+
+    def test_app_db_without_the_highlight_tables_is_off(self, monkeypatch):
+        engine = create_engine("sqlite://")
+        monkeypatch.setattr(ub, "session", sessionmaker(bind=engine)())
+        _fake_cwa_db(monkeypatch, error=RuntimeError("no db"))
+        assert highlight_sync_ever_enabled() is False
+
+    def test_unreadable_everywhere_raises(self, monkeypatch):
+        from cps.progress_syncing import settings as settings_module
+        _fake_cwa_db(monkeypatch, error=RuntimeError("no db"))
+
+        class Broken:
+            def execute(self, *a, **k):
+                raise sqlite3.OperationalError("disk I/O error")
+
+            def rollback(self):
+                pass
+        monkeypatch.setattr(ub, "session", Broken())
+        with pytest.raises(settings_module.SettingsUnreadable):
+            highlight_sync_ever_enabled()
+
+    def test_warm_retries_a_failed_read_and_remembers_on(self, tmp_path, monkeypatch, app_db):
+        from cps.progress_syncing import settings as settings_module
+        answers = [settings_module.SettingsUnreadable("locked"), settings_module.SettingsUnreadable("locked"), True]
+        sleeps = []
+
+        def read():
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        monkeypatch.setattr(settings_module, "_read_highlight_sync_ever", read)
+        monkeypatch.setattr(settings_module.time, "sleep", sleeps.append)
+        assert settings_module.warm_highlight_sync_ever(attempts=3, delay=0.25) is True
+        assert len(sleeps) == 2 and answers == []
+        assert highlight_sync_ever_enabled() is True  # remembered: no further read
+
+    def test_warm_gives_up_quietly(self, monkeypatch):
+        from cps.progress_syncing import settings as settings_module
+
+        def read():
+            raise settings_module.SettingsUnreadable("locked")
+        monkeypatch.setattr(settings_module, "_read_highlight_sync_ever", read)
+        monkeypatch.setattr(settings_module, "_app_db_has_highlight_state",
+                            lambda session=None: (_ for _ in ()).throw(sqlite3.OperationalError("x")))
+        monkeypatch.setattr(settings_module.time, "sleep", lambda s: None)
+        assert settings_module.warm_highlight_sync_ever(attempts=3, delay=0) is False
+
+    def test_startup_warms_ever_even_when_koreader_sync_is_on(self, monkeypatch):
+        from cps.progress_syncing import models, settings as settings_module
+        calls = []
+        monkeypatch.setattr(settings_module, "is_koreader_sync_enabled", lambda: True)
+        monkeypatch.setattr(settings_module, "warm_highlight_sync_ever",
+                            lambda session=None, **k: calls.append(session) or True)
+        monkeypatch.setattr(models, "ensure_app_db_tables", lambda conn: calls.append("app tables"))
+        engine = create_engine("sqlite://")
+        session = sessionmaker(bind=engine)()
+        ub._ensure_progress_sync_tables(engine, session)
+        assert calls == [session, "app tables"]
 
     def test_schema_defaults(self, monkeypatch):
         import os

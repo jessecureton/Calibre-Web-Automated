@@ -717,10 +717,37 @@ class TestRoutingDecision:
             assert (r.status_code, r.get_json()) == (200, [])
         assert len(calls) == 1
 
-    def test_a_raising_read_answers_as_today(self, client, session, kobo_cloud, monkeypatch):
+    def test_an_undecidable_read_refuses_patches_and_names_nothing(self, client, session, kobo_cloud, monkeypatch):
+        """A 200 stub would tell the Kobo its PATCH was stored; 503 makes it keep the highlights and retry."""
         def boom():
             raise RuntimeError("settings unreadable")
         monkeypatch.setattr(kobo_side, "highlight_routing_active", boom)
         r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
-        assert (r.status_code, r.get_json()) == (200, {"data": [], "totalResults": 0})
+        assert r.status_code == 503
+        r = client.post("/api/v3/content/checkforchanges", json=[{"ContentId": UUID, "etag": 'W/"0"'}],
+                        headers=HEADERS)
+        assert (r.status_code, r.get_json()) == (200, [])
         assert kobo_cloud.calls == [] and session.query(Highlight).count() == 0
+
+    def test_unreadable_settings_route_to_cwa_when_app_db_has_highlight_state(self, client, session, monkeypatch,
+                                                                              tmp_path):
+        monkeypatch.setenv("CWA_DB_PATH", str(tmp_path))  # no cwa.db here
+        monkeypatch.setattr(settings, "highlight_sync_ever_enabled", REAL_EVER)
+        monkeypatch.setattr(settings, "is_highlight_sync_enabled", REAL_ON)
+        monkeypatch.setitem(sys.modules, "cwa_db", None)
+        session.add(HighlightBookState(user_id=USER, book_id=BOOK, kobo_etag_version=1))
+        session.commit()
+        no_proxy(monkeypatch)
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        assert r.status_code == 204 and session.query(Highlight).count() == 1
+
+    def test_unreadable_settings_and_app_db_refuse_patches(self, client, session, kobo_cloud, monkeypatch,
+                                                           tmp_path):
+        monkeypatch.setenv("CWA_DB_PATH", str(tmp_path))
+        monkeypatch.setattr(settings, "highlight_sync_ever_enabled", REAL_EVER)
+        monkeypatch.setattr(settings, "is_highlight_sync_enabled", REAL_ON)
+        monkeypatch.setitem(sys.modules, "cwa_db", None)
+        monkeypatch.setattr(settings, "_app_db_has_highlight_state",
+                            lambda session=None: (_ for _ in ()).throw(RuntimeError("app.db locked")))
+        r = client.patch(f"/api/v3/content/{UUID}/annotations", json=patch_body(annotation()), headers=HEADERS)
+        assert r.status_code == 503 and kobo_cloud.calls == []

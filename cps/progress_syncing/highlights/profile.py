@@ -29,7 +29,10 @@ _TOKEN_PREFIX = re.compile(r"^(?:token|bearer)\s+", re.IGNORECASE)
 
 def section_visible() -> bool:
     """The highlight-sync settings show while sync is on, and after it was ever on."""
-    return settings.is_highlight_sync_enabled() or settings.highlight_sync_ever_enabled()
+    try:
+        return settings.is_highlight_sync_enabled() or settings.highlight_sync_ever_enabled()
+    except settings.SettingsUnreadable:
+        return False
 
 
 def new_sync_password(user) -> str:

@@ -174,8 +174,9 @@ def highlight_routing_for_request():
     """Whether CWA owns the Kobo's highlight routes, decided once per request.
 
     The kobo stub decides first; the readingservices decorator reuses its answer,
-    so the two can never disagree. A failed settings read before "ever on" has
-    been seen answers False: as today, the only state a failed read can't rule out.
+    so the two can never disagree. A settings read that fails outright (see
+    `highlight_routing_undecided`) answers False, but marks the request, so a PATCH
+    is refused with 503 rather than acknowledged by a stub.
     """
     decided = g.get("highlight_routing")
     if decided is None:
@@ -184,8 +185,14 @@ def highlight_routing_for_request():
         except Exception as e:
             log.warning(f"[highlight-sync] could not read the highlight sync settings: {type(e).__name__}")
             decided = False
+            g.highlight_routing_undecided = True
         g.highlight_routing = decided
     return decided
+
+
+def highlight_routing_undecided():
+    """Whether this request's routing could not be decided because the settings were unreadable."""
+    return bool(g.get("highlight_routing_undecided"))
 
 
 def _cwa_book_id(entitlement_id):

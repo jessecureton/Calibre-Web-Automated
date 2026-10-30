@@ -1397,6 +1397,14 @@ def _kobo_reading_services_stub():
         if config.config_kobo_proxy and (p.startswith("/api/UserStorage/")
                                          or p.startswith("/api/internal/notebooks")):
             return readingservices.proxy_to_kobo_reading_services()
+    elif readingservices.highlight_routing_undecided():
+        # Can't tell whether CWA owns the highlights. A 200 stub would tell the Kobo
+        # its PATCH was stored; 503 keeps the highlights on the device for a retry.
+        # checkforchanges keeps its stub's [], which names nothing.
+        route = readingservices.highlight_route(request.method, p)
+        if route and route[0] == "annotations" and request.method == "PATCH":
+            log.warning("[highlight-sync] annotations PATCH refused: highlight sync settings unreadable")
+            return make_response("", 503)
     return stub
 
 

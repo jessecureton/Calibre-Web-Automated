@@ -10,6 +10,7 @@
 import os
 import sqlite3
 import sys
+import time
 
 # Access CWA_DB from scripts path (consistent with existing patterns)
 sys.path.insert(1, '/app/calibre-web-automated/scripts/')
@@ -84,35 +85,89 @@ def is_highlight_sync_enabled() -> bool:
 _ever_seen = set()
 
 
+class SettingsUnreadable(Exception):
+    """A setting could not be read at all (as distinct from reading 0)."""
+
+
 def _cwa_db_file() -> str:
     return os.path.join(os.environ.get("CWA_DB_PATH", "/config"), "cwa.db")
 
 
-def highlight_sync_ever_enabled() -> bool:
+def highlight_sync_ever_enabled(session=None) -> bool:
     """Return True if highlight sync has ever been saved as on.
 
     It stays on after the setting is turned off, so that highlights already synced
     keep being served and are not mistaken for deletions. Once read as on it is
     remembered for the life of the process.
+
+    If cwa.db can't be read at all (not a clean 0), it counts as on when app.db's
+    `highlight_book_state` has any rows: those exist only once highlight sync ran.
+    Raises SettingsUnreadable when app.db can't be checked either.
     """
     db_file = _cwa_db_file()
     if db_file in _ever_seen:
         return True
-    ever = _read_highlight_sync_ever()
+    try:
+        ever = _read_highlight_sync_ever()
+    except SettingsUnreadable as unreadable:
+        try:
+            ever = _app_db_has_highlight_state(session)
+        except Exception as e:
+            raise SettingsUnreadable(f"cwa.db and app.db both unreadable ({type(e).__name__})") from unreadable
     if ever:
         _ever_seen.add(db_file)
     return ever
 
 
 def _read_highlight_sync_ever() -> bool:
+    """The stored flag; raises SettingsUnreadable if neither cwa.db read works."""
     try:
         return _read_setting_directly(("kobo_readest_highlight_sync_ever",))
     except sqlite3.Error:
-        pass
+        pass  # missing file or column: the full path below
     try:
         from cwa_db import CWA_DB
         return bool(CWA_DB().cwa_settings.get('kobo_readest_highlight_sync_ever', 0))
-    except Exception:
+    except Exception as e:
+        raise SettingsUnreadable(type(e).__name__) from e
+
+
+def _app_db_has_highlight_state(session=None) -> bool:
+    """Whether app.db has any highlight_book_state row (False if the table doesn't exist)."""
+    from sqlalchemy import text
+    if session is None:
+        from .. import ub
+        session = ub.session
+    try:
+        return session.execute(text("SELECT 1 FROM highlight_book_state LIMIT 1")).first() is not None
+    except Exception as e:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        if "no such table" in str(e):
+            return False
+        raise
+
+
+def warm_highlight_sync_ever(session=None, attempts: int = 3, delay: float = 0.5) -> bool:
+    """
+    Read "ever on" at startup, retrying a failed read, so the process remembers it
+    before the first Kobo request needs it. False if it still can't be read.
+    """
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(delay)
+        try:
+            ever = _read_highlight_sync_ever()
+        except SettingsUnreadable:
+            continue
+        if ever:
+            _ever_seen.add(_cwa_db_file())
+        return ever
+    try:
+        return highlight_sync_ever_enabled(session)  # cwa.db still unreadable: app.db decides
+    except SettingsUnreadable:
         return False
 
 
